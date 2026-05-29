@@ -1,7 +1,7 @@
 {
-  "name": "@baidu/pi-code-block-fix",
+  "name": "pi-code-block-fix",
   "version": "0.1.0",
-  "description": "Unicode box-drawing code block fences for Pi",
+  "description": "Unicode box-drawing code block fences in Pi",
   "type": "module",
   "private": true,
   "keywords": ["pi-package"],

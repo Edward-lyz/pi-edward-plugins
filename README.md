@@ -1,15 +1,12 @@
-# pi-baidu-plugins
+# pi-edward-plugins
 
-Baidu 团队 Pi coding agent 插件集。
+Edward 的 Pi coding agent 个人插件集。
 
 ## 安装
 
 ```bash
-# git 源（推荐）
-pi install git:github.com/Edward-lyz/pi-baidu-plugins
-
-# 或本地路径
-pi install /path/to/pi-baidu-plugins
+# git 源
+pi install git:github.com/Edward-lyz/pi-edward-plugins
 ```
 
 ## 包含插件
@@ -24,13 +21,11 @@ pi install /path/to/pi-baidu-plugins
 
 ## 选用单个插件
 
-通过 settings.json 过滤，只加载需要的：
-
 ```json
 {
   "packages": [
     {
-      "source": "git:github.com/Edward-lyz/pi-baidu-plugins",
+      "source": "git:github.com/Edward-lyz/pi-edward-plugins",
       "extensions": ["packages/code-block-fix/src/index.ts"]
     }
   ]

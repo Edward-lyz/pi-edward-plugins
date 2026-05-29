@@ -1,5 +1,5 @@
 {
-  "name": "@baidu/pi-statusline",
+  "name": "pi-statusline",
   "version": "0.1.0",
   "description": "Pi status line with token rates and model info",
   "type": "module",

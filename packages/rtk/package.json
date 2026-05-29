@@ -1,5 +1,5 @@
 {
-  "name": "@baidu/pi-rtk",
+  "name": "pi-rtk",
   "version": "0.1.0",
   "description": "Tool call rewrite timeout helper",
   "type": "module",

@@ -1,7 +1,7 @@
 {
   "name": "pi-baidu-plugins",
   "version": "0.1.0",
-  "description": "Baidu team plugins for Pi coding agent",
+  "description": "Personal Pi coding agent plugins",
   "private": true,
   "keywords": ["pi-package"],
   "type": "module",

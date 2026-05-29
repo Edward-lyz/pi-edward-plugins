@@ -1,5 +1,5 @@
 {
-  "name": "@baidu/pi-system-context",
+  "name": "pi-system-context",
   "version": "0.1.0",
   "description": "Auto-inject system info and directory tree into system prompt",
   "type": "module",

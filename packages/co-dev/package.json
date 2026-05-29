@@ -1,7 +1,7 @@
 {
-  "name": "@baidu/pi-co-dev",
+  "name": "pi-co-dev",
   "version": "0.1.0",
-  "description": "Baidu co-development assistant",
+  "description": "Co-development assistant",
   "type": "module",
   "private": true,
   "keywords": ["pi-package"],
