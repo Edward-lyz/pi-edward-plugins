@@ -1,7 +1,7 @@
 {
   "name": "pi-rtk",
   "version": "0.1.0",
-  "description": "Tool call rewrite timeout helper",
+  "description": "Rewrite shell tool calls through the rtk CLI before execution",
   "type": "module",
   "private": true,
   "keywords": ["pi-package"],

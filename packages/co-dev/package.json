@@ -1,7 +1,7 @@
 {
   "name": "pi-co-dev",
   "version": "0.1.0",
-  "description": "Co-development assistant",
+  "description": "Pi review-loop assistant powered by a second model",
   "type": "module",
   "private": true,
   "keywords": ["pi-package"],

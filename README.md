@@ -1,33 +1,70 @@
-# pi-edward-plugins
+# pi-better-ux
 
-Edward 的 Pi coding agent 个人插件集。
+Pi Coding Agent 体验和效率增强插件集。
 
-## 安装
+## Install
 
 ```bash
-# git 源
-pi install git:github.com/Edward-lyz/pi-edward-plugins
+# npm package, available after publishing
+pi install npm:pi-better-ux
+
+# Git package, pin a release tag for reproducibility
+pi install git:github.com/Edward-lyz/pi-edward-plugins@v0.1.0
+
+# Local development smoke test
+pi -e .
 ```
 
-## 包含插件
+## Extensions
 
-| 包 | 说明 |
-|---|---|
-| `code-block-fix` | Unicode 框线代码块渲染 |
-| `co-dev` | 协同开发辅助 |
-| `rtk` | Tool call 超时重写 |
-| `statusline` | 状态栏（token 速率、模型信息） |
-| `system-context` | 自动注入系统信息和目录树到 system prompt |
+| Extension | Path | What it does | Notes |
+|---|---|---|---|
+| `code-block-fix` | `packages/code-block-fix/src/index.ts` | Renders markdown code blocks with Unicode box borders. | Monkey-patches Pi markdown rendering. |
+| `co-dev` | `packages/co-dev/src/index.ts` | Runs a second-model review loop after each agent answer. | Configure with `/co-dev`; requires a usable Pi model and API key. |
+| `rtk` | `packages/rtk/src/index.ts` | Rewrites `bash` / `exec_command` commands through `rtk rewrite` before execution. | Requires `rtk` in `PATH`. |
+| `statusline` | `packages/statusline/src/index.ts` | Replaces the footer with model, context, TTFT, and output-rate info. | UI sessions only. |
+| `system-context` | `packages/system-context/src/index.ts` | Injects OS, shell, cwd, Node version, and a shallow directory tree into the system prompt. | Directory tree depth is intentionally small. |
 
-## 选用单个插件
+## Load one extension
 
 ```json
 {
   "packages": [
     {
-      "source": "git:github.com/Edward-lyz/pi-edward-plugins",
+      "source": "npm:pi-better-ux",
       "extensions": ["packages/code-block-fix/src/index.ts"]
     }
   ]
 }
+```
+
+For Git installs, replace `source` with
+`git:github.com/Edward-lyz/pi-edward-plugins@v0.1.0`.
+
+## Publish
+
+Pi package discovery is npm-based. `pi.dev/packages` lists npm packages tagged
+with the `pi-package` keyword and reads the `pi` manifest from `package.json`.
+
+```bash
+npm login
+npm whoami
+npm view pi-better-ux name version || true
+npm run pack:dry-run
+npm publish --access public
+```
+
+After publishing, wait for the pi.dev crawler to index the npm package. Users can
+then install it with:
+
+```bash
+pi install npm:pi-better-ux
+```
+
+For a new release:
+
+```bash
+npm version patch
+git push origin main --tags
+npm publish --access public
 ```
