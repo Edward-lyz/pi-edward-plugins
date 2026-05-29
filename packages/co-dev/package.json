@@ -1,0 +1,17 @@
+{
+  "name": "@baidu/pi-co-dev",
+  "version": "0.1.0",
+  "description": "Baidu co-development assistant",
+  "type": "module",
+  "private": true,
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "@baidu/pi-system-context",
+  "version": "0.1.0",
+  "description": "Auto-inject system info and directory tree into system prompt",
+  "type": "module",
+  "private": true,
+  "keywords": ["pi-package"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
