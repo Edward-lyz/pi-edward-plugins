@@ -62,7 +62,7 @@ function buildStatusLine(ctx: ExtensionContext, state: RuntimeState): string {
 			? state.lastRates.ttft
 			: Math.max(0.001, (state.roundFirstAssistantAt - (state.roundStartedAt ?? state.roundFirstAssistantAt)) / 1000);
 	const ratePrefix = state.lastRates.outputEstimated ? '~' : '';
-	const rateText = `TTFT ${formatRate(ttft)}s · out ${ratePrefix}${formatRate(state.lastRates.output)} tok/s`;
+	const rateText = `TTFT ${formatRate(ttft)}s · TPS ${ratePrefix}${formatRate(state.lastRates.output)}`;
 
 	return [
 		theme.fg('accent', ` ${model} `),
