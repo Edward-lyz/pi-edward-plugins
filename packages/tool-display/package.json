@@ -1,13 +1,17 @@
 {
   "name": "pi-tool-display",
   "version": "0.1.0",
-  "description": "Compact Pi tool rendering with details on expansion",
+  "description": "Hide collapsed Pi tool rows and show full details only on expansion",
   "type": "module",
   "private": true,
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",

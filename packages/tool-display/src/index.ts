@@ -1,158 +1,80 @@
-import type {
-  AgentToolResult,
-  ExtensionAPI,
-  Theme,
-  ToolDefinition,
-  ToolRenderContext,
-  ToolRenderResultOptions,
-} from '@earendil-works/pi-coding-agent';
-import {
-  createBashToolDefinition,
-  createEditToolDefinition,
-  createFindToolDefinition,
-  createGrepToolDefinition,
-  createLsToolDefinition,
-  createReadToolDefinition,
-  createWriteToolDefinition,
-  keyHint,
-} from '@earendil-works/pi-coding-agent';
-import { Container, Text } from '@earendil-works/pi-tui';
+import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { ToolExecutionComponent } from '@earendil-works/pi-coding-agent';
 
-function stringValue(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
+type ToolExecutionInstance = InstanceType<typeof ToolExecutionComponent> & {
+  expanded?: boolean;
+};
+
+type ToolRender = (this: ToolExecutionInstance, width: number) => string[];
+
+const ORIGINAL_RENDER = Symbol.for('pi-better-ux.tool-display.original-render');
+const SHOULD_HIDE = Symbol.for('pi-better-ux.tool-display.should-hide');
+
+type PatchedToolExecutionPrototype = ToolExecutionInstance & {
+  render: ToolRender;
+  [ORIGINAL_RENDER]?: ToolRender;
+  [SHOULD_HIDE]?: () => boolean;
+};
+
+function installToolRenderPatch(isHidden: () => boolean) {
+  const prototype = ToolExecutionComponent.prototype as PatchedToolExecutionPrototype;
+  prototype[SHOULD_HIDE] = isHidden;
+
+  if (prototype[ORIGINAL_RENDER]) return;
+
+  const originalRender = prototype.render;
+  prototype[ORIGINAL_RENDER] = originalRender;
+  prototype.render = function renderToolExecution(width: number): string[] {
+    if (prototype[SHOULD_HIDE]?.() && !this.expanded) return [];
+    return originalRender.call(this, width);
+  };
 }
 
-function numberValue(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
-}
-
-function objectValue(value: unknown): Record<string, unknown> {
-  return value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
-}
-
-function firstCommandLine(command: string | undefined): string {
-  if (!command) return '…';
-  return command.split('\n').find((line) => line.trim() !== '')?.trim() ?? '…';
-}
-
-function summarizeToolCall(toolName: string, args: unknown): string {
-  const input = objectValue(args);
-
-  if (toolName === 'bash') {
-    const command = firstCommandLine(stringValue(input.command));
-    const timeout = numberValue(input.timeout);
-    return timeout === undefined ? `$ ${command}` : `$ ${command} · ${timeout}s`;
+function updateWorkingMessage(ctx: ExtensionContext, activeToolCalls: Set<string>) {
+  if (activeToolCalls.size === 0) {
+    ctx.ui.setWorkingMessage();
+    return;
   }
 
-  if (toolName === 'read') {
-    const path = stringValue(input.path) ?? '…';
-    const offset = numberValue(input.offset);
-    const limit = numberValue(input.limit);
-    const range = offset === undefined && limit === undefined
-      ? ''
-      : ` · ${offset ?? 1}:${limit ?? 'end'}`;
-    return `read ${path}${range}`;
-  }
-
-  if (toolName === 'edit') {
-    const path = stringValue(input.path) ?? '…';
-    const edits = Array.isArray(input.edits) ? input.edits.length : 0;
-    return `edit ${path} · ${edits} block${edits === 1 ? '' : 's'}`;
-  }
-
-  if (toolName === 'write') {
-    const path = stringValue(input.path) ?? '…';
-    const content = stringValue(input.content);
-    const lineCount = content === undefined ? undefined : content.split('\n').length;
-    return lineCount === undefined ? `write ${path}` : `write ${path} · ${lineCount} lines`;
-  }
-
-  if (toolName === 'grep') {
-    const pattern = stringValue(input.pattern) ?? '…';
-    const path = stringValue(input.path) ?? '.';
-    const glob = stringValue(input.glob);
-    return glob === undefined ? `grep ${pattern} in ${path}` : `grep ${pattern} in ${path} · ${glob}`;
-  }
-
-  if (toolName === 'find') {
-    return `find ${stringValue(input.pattern) ?? '…'} in ${stringValue(input.path) ?? '.'}`;
-  }
-
-  if (toolName === 'ls') {
-    return `ls ${stringValue(input.path) ?? '.'}`;
-  }
-
-  return toolName;
-}
-
-function compactCallText(toolName: string, args: unknown, theme: Theme, context: ToolRenderContext): string {
-  const icon = context.isPartial ? '↻' : context.isError ? '✗' : '✓';
-  const iconColor = context.isPartial ? 'muted' : context.isError ? 'error' : 'success';
-  const title = theme.fg(iconColor, icon) + ' ' + theme.fg('toolTitle', theme.bold(toolName));
-  const summary = theme.fg('muted', summarizeToolCall(toolName, args));
-  const hint = context.expanded ? '' : theme.fg('dim', ` (${keyHint('app.tools.expand', 'details')})`);
-  return `${title} ${summary}${hint}`;
-}
-
-function registerCompactRenderer(pi: ExtensionAPI, definition: ToolDefinition, isCompactEnabled: () => boolean) {
-  pi.registerTool({
-    ...definition,
-    renderCall(args: unknown, theme: Theme, context: ToolRenderContext) {
-      if ((!isCompactEnabled() || context.expanded) && definition.renderCall) {
-        return definition.renderCall(args, theme, { ...context, lastComponent: undefined });
-      }
-
-      return new Text(compactCallText(definition.name, args, theme, context), 0, 0);
-    },
-    renderResult(result: AgentToolResult<unknown>, options: ToolRenderResultOptions, theme: Theme, context: ToolRenderContext) {
-      if (!isCompactEnabled() || options.expanded) {
-        if (definition.renderResult) {
-          return definition.renderResult(result, options, theme, { ...context, lastComponent: undefined });
-        }
-
-        return new Text(JSON.stringify(result, null, 2), 0, 0);
-      }
-
-      return new Container();
-    },
-  } as ToolDefinition);
+  const suffix = activeToolCalls.size === 1 ? 'tool' : 'tools';
+  ctx.ui.setWorkingMessage(`Working · ${activeToolCalls.size} ${suffix}`);
 }
 
 export default function toolDisplay(pi: ExtensionAPI) {
-  let compactEnabled = true;
+  let hideCollapsedTools = true;
+  const activeToolCalls = new Set<string>();
 
-  pi.on('session_start', (_event, ctx) => {
-    const definitions = [
-      createBashToolDefinition(ctx.cwd),
-      createReadToolDefinition(ctx.cwd),
-      createEditToolDefinition(ctx.cwd),
-      createWriteToolDefinition(ctx.cwd),
-      createGrepToolDefinition(ctx.cwd),
-      createFindToolDefinition(ctx.cwd),
-      createLsToolDefinition(ctx.cwd),
-    ];
+  installToolRenderPatch(() => hideCollapsedTools);
 
-    for (const definition of definitions) {
-      registerCompactRenderer(pi, definition as ToolDefinition, () => compactEnabled);
-    }
+  pi.on('tool_execution_start', (event, ctx) => {
+    activeToolCalls.add(event.toolCallId);
+    updateWorkingMessage(ctx, activeToolCalls);
+  });
+
+  pi.on('tool_execution_end', (event, ctx) => {
+    activeToolCalls.delete(event.toolCallId);
+    updateWorkingMessage(ctx, activeToolCalls);
+  });
+
+  pi.on('agent_end', (_event, ctx) => {
+    activeToolCalls.clear();
+    updateWorkingMessage(ctx, activeToolCalls);
   });
 
   pi.registerCommand('tool-display', {
-    description: 'Control compact tool rendering: on, off, expand, collapse, status',
+    description: 'Control hidden collapsed tool rendering: on, off, expand, collapse, status',
     handler: async (args, ctx) => {
       const action = args.trim();
 
       if (action === 'on') {
-        compactEnabled = true;
-        ctx.ui.notify('Tool display compact mode enabled.', 'info');
+        hideCollapsedTools = true;
+        ctx.ui.notify('Collapsed tool rows are now hidden. Use Ctrl+O to show details.', 'info');
         return;
       }
 
       if (action === 'off') {
-        compactEnabled = false;
-        ctx.ui.notify('Tool display compact mode disabled.', 'info');
+        hideCollapsedTools = false;
+        ctx.ui.notify('Collapsed tool rows are now visible.', 'info');
         return;
       }
 
@@ -167,7 +89,7 @@ export default function toolDisplay(pi: ExtensionAPI) {
       }
 
       if (action === '' || action === 'status') {
-        const mode = compactEnabled ? 'on' : 'off';
+        const mode = hideCollapsedTools ? 'hidden' : 'visible';
         const expanded = ctx.ui.getToolsExpanded() ? 'expanded' : 'collapsed';
         const help = 'Usage: /tool-display on|off|expand|collapse|status';
         ctx.ui.notify(`Tool display: ${mode}, ${expanded}. ${help}`, 'info');
