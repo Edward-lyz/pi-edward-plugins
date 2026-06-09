@@ -33,6 +33,23 @@ function formatWindow(ctx: ExtensionContext): string {
 	return `ctx ${formatCount(used)}/${formatCount(contextWindow)} ${percent}`;
 }
 
+function formatCacheHitRate(ctx: ExtensionContext): string | undefined {
+	let totalCacheRead = 0;
+	let totalCacheWrite = 0;
+	let hitRate: number | undefined;
+	for (const entry of ctx.sessionManager.getEntries()) {
+		if (entry.type !== 'message' || entry.message.role !== 'assistant') continue;
+
+		const message = entry.message as AssistantMessage;
+		totalCacheRead += message.usage.cacheRead;
+		totalCacheWrite += message.usage.cacheWrite;
+		const promptTokens = message.usage.input + message.usage.cacheRead + message.usage.cacheWrite;
+		if (promptTokens > 0) hitRate = (message.usage.cacheRead / promptTokens) * 100;
+	}
+	if (hitRate === undefined || (totalCacheRead === 0 && totalCacheWrite === 0)) return undefined;
+	return `CH ${hitRate.toFixed(1)}%`;
+}
+
 function formatRate(value: number | undefined): string {
 	if (value === undefined) return '…';
 	if (value < 10) return value.toFixed(1);
@@ -63,12 +80,14 @@ function buildStatusLine(ctx: ExtensionContext, state: RuntimeState): string {
 			: Math.max(0.001, (state.roundFirstAssistantAt - (state.roundStartedAt ?? state.roundFirstAssistantAt)) / 1000);
 	const ratePrefix = state.lastRates.outputEstimated ? '~' : '';
 	const rateText = `TTFT ${formatRate(ttft)}s · TPS ${ratePrefix}${formatRate(state.lastRates.output)}`;
+	const cacheHitRate = formatCacheHitRate(ctx);
 
 	return [
 		theme.fg('accent', ` ${model} `),
 		theme.fg('muted', formatWindow(ctx)),
+		cacheHitRate === undefined ? undefined : theme.fg('muted', cacheHitRate),
 		theme.fg('success', rateText),
-	].join(theme.fg('dim', ' │ '));
+	].filter((part): part is string => part !== undefined).join(theme.fg('dim', ' │ '));
 }
 
 export default function statusline(pi: ExtensionAPI) {

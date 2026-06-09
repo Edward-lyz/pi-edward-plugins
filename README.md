@@ -22,7 +22,7 @@ pi -e .
 | `code-block-fix` | `packages/code-block-fix/src/index.ts` | Renders markdown code blocks with Unicode box borders. | Monkey-patches Pi markdown rendering. |
 | `co-dev` | `packages/co-dev/src/index.ts` | Runs a second-model review loop after each agent answer. | Configure with `/co-dev`; requires a usable Pi model and API key. |
 | `rtk` | `packages/rtk/src/index.ts` | Rewrites `bash` / `exec_command` commands through `rtk rewrite` before execution. | Requires `rtk` in `PATH`. |
-| `statusline` | `packages/statusline/src/index.ts` | Replaces the footer with model, context, TTFT, and output-rate info. | UI sessions only. |
+| `statusline` | `packages/statusline/src/index.ts` | Replaces the footer with model, context, cache-hit rate, TTFT, and output-rate info. | UI sessions only. |
 | `system-context` | `packages/system-context/src/index.ts` | Injects OS, shell, cwd, Node version, and a shallow directory tree into the system prompt. | Directory tree depth is intentionally small. |
 | `thinking-display` | `packages/thinking-display/src/index.ts` | Collapses thinking traces into one compact `thinking` marker. | Use `/thinking-display on\|off\|status`. |
 | `tool-display` | `packages/tool-display/src/index.ts` | Hides collapsed tool rows, shows a working message while tools run, and restores full tool details on expansion. | Use `Ctrl+O` or `/tool-display expand`. |
