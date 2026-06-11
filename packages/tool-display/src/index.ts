@@ -23,7 +23,7 @@ type ThemeLike = { fg(color: string, text: string): string };
 type DiffRow = {
   left: string;
   right: string;
-  kind: 'change' | 'context' | 'header';
+  kind: 'change' | 'context' | 'file';
 };
 
 type PatchedToolExecutionPrototype = ToolExecutionInstance & {
@@ -56,6 +56,11 @@ function shortenPath(p: string): string {
   return p.startsWith(home) ? `~${p.slice(home.length)}` : p;
 }
 
+function displayPath(path: string, cwd?: string): string {
+  if (cwd && path.startsWith(`${cwd}/`)) return path.slice(cwd.length + 1);
+  return shortenPath(path);
+}
+
 function fitCell(text: string, width: number): string {
   const normalized = text.replace(/\t/g, '   ');
   return truncateToWidth(normalized, width, '…', true);
@@ -83,13 +88,13 @@ function patchStats(patchText: string): { files: string[]; additions: number; re
   return { files, additions, removals };
 }
 
-function formatPatchSummary(patchText: string): string {
+function formatPatchSummary(patchText: string, cwd?: string): string {
   const stats = patchStats(patchText);
-  const file = stats.files[0] ? shortenPath(stats.files[0]) : 'patch';
+  const file = stats.files[0] ? displayPath(stats.files[0], cwd) : 'patch';
   return `${file} +${stats.additions}/-${stats.removals}`;
 }
 
-function formatArgs(toolName: string, args: Record<string, unknown> | undefined): string {
+function formatArgs(toolName: string, args: Record<string, unknown> | undefined, cwd?: string): string {
   if (!args) return '';
 
   const name = baseToolName(toolName);
@@ -103,18 +108,18 @@ function formatArgs(toolName: string, args: Record<string, unknown> | undefined)
   if (name === 'apply_patch') {
     const patchText = firstString(args.input, args.patch, args.diff);
     if (!patchText) return '';
-    const summary = formatPatchSummary(patchText);
+    const summary = formatPatchSummary(patchText, cwd);
     return summary.length > 80 ? `${summary.slice(0, 77)}...` : summary;
   }
   if (name === 'edit') {
     const pathVal = firstString(args.path, args.file_path);
     const editCount = Array.isArray(args.edits) ? ` · ${args.edits.length} edit(s)` : '';
-    return `${shortenPath(pathVal)}${editCount}`;
+    return `${displayPath(pathVal, cwd)}${editCount}`;
   }
   if (name === 'write') {
     const pathVal = firstString(args.path, args.file_path);
     const content = typeof args.content === 'string' ? ` · ${args.content.split('\n').length} lines` : '';
-    return `${shortenPath(pathVal)}${content}`;
+    return `${displayPath(pathVal, cwd)}${content}`;
   }
   if (name === 'grep') {
     const pattern = firstString(args.pattern, args.query);
@@ -145,25 +150,23 @@ function stripDiffContent(line: string, prefix: string): string {
 function buildDiffRows(diffText: string): DiffRow[] {
   const diffLines = diffText.split('\n');
   const parsed = diffLines.map((line) => {
-    if (
-      line.startsWith('*** ') ||
-      line.startsWith('@@') ||
-      line.startsWith('diff --git') ||
-      line.startsWith('index ')
-    ) {
-      return { kind: 'header' as const, text: line };
+    const fileMatch = line.match(/^\*\*\* (?:Update|Add|Delete) File: (.+)$/);
+    if (fileMatch?.[1]) return { kind: 'file' as const, text: fileMatch[1] };
+    if (line.startsWith('*** ') || line.startsWith('@@') || line.startsWith('diff --git') || line.startsWith('index ')) {
+      return { kind: 'skip' as const, text: '' };
     }
     if (line.startsWith('-') && !line.startsWith('---')) return { kind: 'remove' as const, text: stripDiffContent(line, '-') };
     if (line.startsWith('+') && !line.startsWith('+++')) return { kind: 'add' as const, text: stripDiffContent(line, '+') };
     if (line.startsWith(' ')) return { kind: 'context' as const, text: stripDiffContent(line, ' ') };
-    return { kind: 'header' as const, text: line };
+    return { kind: 'skip' as const, text: '' };
   });
 
   const rows: DiffRow[] = [];
   for (let i = 0; i < parsed.length; i++) {
     const current = parsed[i]!;
-    if (current.kind === 'header') {
-      if (current.text) rows.push({ left: current.text, right: '', kind: 'header' });
+    if (current.kind === 'skip') continue;
+    if (current.kind === 'file') {
+      rows.push({ left: current.text, right: '', kind: 'file' });
       continue;
     }
     if (current.kind === 'context') {
@@ -195,26 +198,27 @@ function buildDiffRows(diffText: string): DiffRow[] {
   return rows;
 }
 
-function renderSideBySideDiff(title: string, diffText: string, width: number, t: ThemeLike): string[] {
+function renderSideBySideDiff(title: string, diffText: string, width: number, t: ThemeLike, cwd?: string): string[] {
   const columnWidth = Math.max(8, Math.floor((width - 9) / 2));
   const fullWidthText = Math.max(1, width - 2);
-  const lines = [`  ${t.fg('toolTitle', fitCell(title, fullWidthText).trimEnd())}`];
+  const lines = [`  ${t.fg('toolTitle', truncateToWidth(title, fullWidthText, '…'))}`];
 
   for (const row of buildDiffRows(diffText)) {
-    if (row.kind === 'header') {
-      lines.push(`  ${t.fg('muted', fitCell(row.left, fullWidthText).trimEnd())}`);
+    if (row.kind === 'file') {
+      lines.push(`  ${t.fg('muted', `── ${truncateToWidth(displayPath(row.left, cwd), fullWidthText - 3, '…')}`)}`);
+      continue;
+    }
+    if (row.kind === 'context') {
+      const contextText = truncateToWidth(row.left.trimEnd(), fullWidthText - 3, '…');
+      if (contextText) lines.push(`  ${t.fg('muted', `   ${contextText}`)}`);
       continue;
     }
     const left = fitCell(row.left, columnWidth);
     const right = fitCell(row.right, columnWidth);
-    if (row.kind === 'context') {
-      lines.push(`  ${t.fg('muted', `  ${left} │  ${right}`)}`);
-      continue;
-    }
-    lines.push(`  ${t.fg('error', `- ${left}`)} │ ${t.fg('success', `+ ${right}`)}`);
+    lines.push(`  ${t.fg('error', `− ${left}`)}│ ${t.fg('success', `+ ${right}`)}`);
   }
 
-  return ['', ...lines];
+  return ['', ...lines.map((line) => truncateToWidth(line, width, '…'))];
 }
 
 function editDiffFromArgs(args: Record<string, unknown> | undefined): string {
@@ -239,17 +243,17 @@ function editDiffFromArgs(args: Record<string, unknown> | undefined): string {
 
 function renderMutationTool(instance: ToolExecutionInstance, width: number, t: ThemeLike, originalRender: ToolRender): string[] {
   const toolName = baseToolName(instance.toolName ?? '?');
-  const pathSummary = formatArgs(toolName, instance.args);
+  const pathSummary = formatArgs(toolName, instance.args, instance.cwd);
   const titleStatus = instance.result?.isError ? '✗' : instance.result || instance.isPartial === false ? '✔' : '⏺';
-  const title = `${titleStatus} ${TOOL_ICONS[toolName] ?? '⚙'} ${toolName}${pathSummary ? `  ${pathSummary}` : ''}`;
+  const title = `${titleStatus} ${TOOL_ICONS[toolName] ?? '⚙'} ${toolName}${pathSummary ? ` · ${pathSummary}` : ''}`;
 
   if (toolName === 'apply_patch') {
     const patchText = firstString(instance.args?.input, instance.args?.patch, instance.args?.diff);
-    if (patchText) return renderSideBySideDiff(title, patchText, width, t);
+    if (patchText) return renderSideBySideDiff(title, patchText, width, t, instance.cwd);
   }
   if (toolName === 'edit') {
     const diffText = typeof instance.result?.details?.diff === 'string' ? instance.result.details.diff : editDiffFromArgs(instance.args);
-    if (diffText) return renderSideBySideDiff(title, diffText, width, t);
+    if (diffText) return renderSideBySideDiff(title, diffText, width, t, instance.cwd);
   }
 
   if (!instance.expanded) {
