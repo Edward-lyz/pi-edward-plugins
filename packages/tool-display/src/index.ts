@@ -1,5 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { ToolExecutionComponent } from '@earendil-works/pi-coding-agent';
+import { truncateToWidth } from '@earendil-works/pi-tui';
 import * as os from 'node:os';
 
 type ToolExecutionInstance = InstanceType<typeof ToolExecutionComponent> & {
@@ -57,9 +58,7 @@ function shortenPath(p: string): string {
 
 function fitCell(text: string, width: number): string {
   const normalized = text.replace(/\t/g, '   ');
-  if (normalized.length <= width) return normalized.padEnd(width);
-  if (width <= 1) return '…';
-  return `${normalized.slice(0, width - 1)}…`;
+  return truncateToWidth(normalized, width, '…', true);
 }
 
 function firstString(...values: unknown[]): string {
@@ -197,8 +196,7 @@ function buildDiffRows(diffText: string): DiffRow[] {
 }
 
 function renderSideBySideDiff(title: string, diffText: string, width: number, t: ThemeLike): string[] {
-  const bodyWidth = Math.max(40, width - 4);
-  const columnWidth = Math.max(16, Math.floor((bodyWidth - 5) / 2));
+  const columnWidth = Math.max(8, Math.floor((width - 9) / 2));
   const fullWidthText = Math.max(1, width - 2);
   const lines = [`  ${t.fg('toolTitle', fitCell(title, fullWidthText).trimEnd())}`];
 
@@ -210,7 +208,7 @@ function renderSideBySideDiff(title: string, diffText: string, width: number, t:
     const left = fitCell(row.left, columnWidth);
     const right = fitCell(row.right, columnWidth);
     if (row.kind === 'context') {
-      lines.push(`  ${t.fg('muted', `  ${left} │   ${right}`)}`);
+      lines.push(`  ${t.fg('muted', `  ${left} │  ${right}`)}`);
       continue;
     }
     lines.push(`  ${t.fg('error', `- ${left}`)} │ ${t.fg('success', `+ ${right}`)}`);
