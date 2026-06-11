@@ -1,7 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { ToolExecutionComponent } from '@earendil-works/pi-coding-agent';
 import { truncateToWidth } from '@earendil-works/pi-tui';
+import { structuredPatch } from 'diff';
+import { readFile } from 'node:fs/promises';
 import * as os from 'node:os';
+import * as path from 'node:path';
 
 type ToolExecutionInstance = InstanceType<typeof ToolExecutionComponent> & {
   expanded?: boolean;
@@ -17,13 +20,26 @@ type ToolRender = (this: ToolExecutionInstance, width: number) => string[];
 const ORIGINAL_RENDER = Symbol.for('pi-better-ux.tool-display.original-render');
 const SHOULD_HIDE = Symbol.for('pi-better-ux.tool-display.should-hide');
 const GET_THEME = Symbol.for('pi-better-ux.tool-display.get-theme');
+const GET_REVIEW_DIFFS = Symbol.for('pi-better-ux.tool-display.get-review-diffs');
 
 type ThemeLike = { fg(color: string, text: string): string };
 
 type DiffRow = {
+  oldNumber?: number;
+  newNumber?: number;
   left: string;
   right: string;
   kind: 'change' | 'context' | 'file';
+};
+
+type ReviewFileDiff = {
+  path: string;
+  rows: DiffRow[];
+};
+
+type FileSnapshot = {
+  paths: string[];
+  before: Map<string, string | null>;
 };
 
 type PatchedToolExecutionPrototype = ToolExecutionInstance & {
@@ -31,6 +47,7 @@ type PatchedToolExecutionPrototype = ToolExecutionInstance & {
   [ORIGINAL_RENDER]?: ToolRender;
   [SHOULD_HIDE]?: () => boolean;
   [GET_THEME]?: () => ThemeLike | undefined;
+  [GET_REVIEW_DIFFS]?: (toolCallId: string) => ReviewFileDiff[] | undefined;
 };
 
 const TOOL_ICONS: Record<string, string> = {
@@ -59,6 +76,10 @@ function shortenPath(p: string): string {
 function displayPath(path: string, cwd?: string): string {
   if (cwd && path.startsWith(`${cwd}/`)) return path.slice(cwd.length + 1);
   return shortenPath(path);
+}
+
+function resolveFilePath(rawPath: string, cwd: string): string {
+  return path.isAbsolute(rawPath) ? rawPath : path.resolve(cwd, rawPath);
 }
 
 function fitCell(text: string, width: number): string {
@@ -147,6 +168,37 @@ function stripDiffContent(line: string, prefix: string): string {
   return line.slice(1);
 }
 
+function parsePatchPaths(patchText: string, cwd: string): string[] {
+  const paths = new Set<string>();
+  for (const line of patchText.split('\n')) {
+    const fileMatch = line.match(/^\*\*\* (?:Update|Add|Delete) File: (.+)$/);
+    if (fileMatch?.[1]) paths.add(resolveFilePath(fileMatch[1], cwd));
+  }
+  return [...paths];
+}
+
+function mutationPaths(toolName: string, input: Record<string, unknown>, cwd: string): string[] {
+  const name = baseToolName(toolName);
+  if (name === 'edit' || name === 'write') {
+    const rawPath = firstString(input.path, input.file_path);
+    return rawPath ? [resolveFilePath(rawPath, cwd)] : [];
+  }
+  if (name === 'apply_patch') {
+    const patchText = firstString(input.input, input.patch, input.diff);
+    return patchText ? parsePatchPaths(patchText, cwd) : [];
+  }
+  return [];
+}
+
+async function readTextFileIfExists(filePath: string): Promise<string | null> {
+  try {
+    return await readFile(filePath, 'utf8');
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
 function buildDiffRows(diffText: string): DiffRow[] {
   const diffLines = diffText.split('\n');
   const parsed = diffLines.map((line) => {
@@ -198,27 +250,91 @@ function buildDiffRows(diffText: string): DiffRow[] {
   return rows;
 }
 
-function renderSideBySideDiff(title: string, diffText: string, width: number, t: ThemeLike, cwd?: string): string[] {
-  const columnWidth = Math.max(8, Math.floor((width - 9) / 2));
+function buildReviewRows(oldText: string, newText: string): DiffRow[] {
+  const patch = structuredPatch('', '', oldText, newText, '', '', { context: 3 });
+  const rows: DiffRow[] = [];
+
+  for (const hunk of patch.hunks) {
+    let oldNumber = hunk.oldStart;
+    let newNumber = hunk.newStart;
+    for (let i = 0; i < hunk.lines.length; i++) {
+      const line = hunk.lines[i]!;
+      if (line.startsWith('\\')) continue;
+      if (line.startsWith(' ')) {
+        rows.push({ oldNumber, newNumber, left: line.slice(1), right: line.slice(1), kind: 'context' });
+        oldNumber++;
+        newNumber++;
+        continue;
+      }
+      if (!line.startsWith('-')) {
+        rows.push({ newNumber, left: '', right: line.slice(1), kind: 'change' });
+        newNumber++;
+        continue;
+      }
+
+      const removed: Array<{ number: number; text: string }> = [];
+      while (i < hunk.lines.length && hunk.lines[i]?.startsWith('-')) {
+        removed.push({ number: oldNumber, text: hunk.lines[i]!.slice(1) });
+        oldNumber++;
+        i++;
+      }
+      const added: Array<{ number: number; text: string }> = [];
+      while (i < hunk.lines.length && hunk.lines[i]?.startsWith('+')) {
+        added.push({ number: newNumber, text: hunk.lines[i]!.slice(1) });
+        newNumber++;
+        i++;
+      }
+      i--;
+
+      const pairCount = Math.max(removed.length, added.length);
+      for (let pairIndex = 0; pairIndex < pairCount; pairIndex++) {
+        rows.push({
+          oldNumber: removed[pairIndex]?.number,
+          newNumber: added[pairIndex]?.number,
+          left: removed[pairIndex]?.text ?? '',
+          right: added[pairIndex]?.text ?? '',
+          kind: 'change',
+        });
+      }
+    }
+  }
+
+  return rows;
+}
+
+function renderReviewDiff(title: string, files: ReviewFileDiff[], width: number, t: ThemeLike, cwd?: string): string[] {
+  const maxLine = Math.max(1, ...files.flatMap((file) => file.rows.flatMap((row) => [row.oldNumber ?? 0, row.newNumber ?? 0])));
+  const gutterWidth = Math.max(3, String(maxLine).length);
+  const columnWidth = Math.max(8, Math.floor((width - 11 - gutterWidth * 2) / 2));
   const fullWidthText = Math.max(1, width - 2);
   const lines = [`  ${t.fg('toolTitle', truncateToWidth(title, fullWidthText, '…'))}`];
 
-  for (const row of buildDiffRows(diffText)) {
-    if (row.kind === 'file') {
-      lines.push(`  ${t.fg('muted', `── ${truncateToWidth(displayPath(row.left, cwd), fullWidthText - 3, '…')}`)}`);
-      continue;
+  for (const file of files) {
+    if (file.path) {
+      lines.push(`  ${t.fg('muted', `── ${truncateToWidth(displayPath(file.path, cwd), fullWidthText - 3, '…')}`)}`);
     }
-    if (row.kind === 'context') {
-      const contextText = truncateToWidth(row.left.trimEnd(), fullWidthText - 3, '…');
-      if (contextText) lines.push(`  ${t.fg('muted', `   ${contextText}`)}`);
-      continue;
+    for (const row of file.rows) {
+      const oldNo = String(row.oldNumber ?? '').padStart(gutterWidth);
+      const newNo = String(row.newNumber ?? '').padStart(gutterWidth);
+      const left = fitCell(row.left, columnWidth);
+      const right = fitCell(row.right, columnWidth);
+      if (row.kind === 'context') {
+        lines.push(`  ${t.fg('muted', `${oldNo} │ ${left} │ ${newNo} │ ${right}`)}`);
+        continue;
+      }
+      if (row.kind === 'file') {
+        lines.push(`  ${t.fg('muted', `── ${truncateToWidth(displayPath(row.left, cwd), fullWidthText - 3, '…')}`)}`);
+        continue;
+      }
+      lines.push(`  ${t.fg('error', `${oldNo}−│ ${left}`)} │ ${t.fg('success', `${newNo}+│ ${right}`)}`);
     }
-    const left = fitCell(row.left, columnWidth);
-    const right = fitCell(row.right, columnWidth);
-    lines.push(`  ${t.fg('error', `− ${left}`)}│ ${t.fg('success', `+ ${right}`)}`);
   }
 
   return ['', ...lines.map((line) => truncateToWidth(line, width, '…'))];
+}
+
+function renderSideBySideDiff(title: string, diffText: string, width: number, t: ThemeLike, cwd?: string): string[] {
+  return renderReviewDiff(title, [{ path: '', rows: buildDiffRows(diffText) }], width, t, cwd);
 }
 
 function editDiffFromArgs(args: Record<string, unknown> | undefined): string {
@@ -248,12 +364,20 @@ function renderMutationTool(instance: ToolExecutionInstance, width: number, t: T
   const title = `${titleStatus} ${TOOL_ICONS[toolName] ?? '⚙'} ${toolName}${pathSummary ? ` · ${pathSummary}` : ''}`;
 
   if (toolName === 'apply_patch') {
+    const reviewDiffs = prototypeReviewDiffs(instance.toolCallId);
+    if (reviewDiffs?.length) return renderReviewDiff(title, reviewDiffs, width, t, instance.cwd);
     const patchText = firstString(instance.args?.input, instance.args?.patch, instance.args?.diff);
     if (patchText) return renderSideBySideDiff(title, patchText, width, t, instance.cwd);
   }
   if (toolName === 'edit') {
+    const reviewDiffs = prototypeReviewDiffs(instance.toolCallId);
+    if (reviewDiffs?.length) return renderReviewDiff(title, reviewDiffs, width, t, instance.cwd);
     const diffText = typeof instance.result?.details?.diff === 'string' ? instance.result.details.diff : editDiffFromArgs(instance.args);
     if (diffText) return renderSideBySideDiff(title, diffText, width, t, instance.cwd);
+  }
+  if (toolName === 'write') {
+    const reviewDiffs = prototypeReviewDiffs(instance.toolCallId);
+    if (reviewDiffs?.length) return renderReviewDiff(title, reviewDiffs, width, t, instance.cwd);
   }
 
   if (!instance.expanded) {
@@ -261,6 +385,12 @@ function renderMutationTool(instance: ToolExecutionInstance, width: number, t: T
     instance.updateDisplay?.();
   }
   return originalRender.call(instance, width);
+}
+
+function prototypeReviewDiffs(toolCallId: string | undefined): ReviewFileDiff[] | undefined {
+  if (!toolCallId) return undefined;
+  const prototype = ToolExecutionComponent.prototype as PatchedToolExecutionPrototype;
+  return prototype[GET_REVIEW_DIFFS]?.(toolCallId);
 }
 
 function renderInlineSummary(instance: ToolExecutionInstance, t: ThemeLike): string {
@@ -278,10 +408,15 @@ function renderInlineSummary(instance: ToolExecutionInstance, t: ThemeLike): str
   return `  ${t.fg('success', `✔ ${icon} ${toolName}`)}${arg}`;
 }
 
-function installToolRenderPatch(isHidden: () => boolean, getTheme: () => ThemeLike | undefined) {
+function installToolRenderPatch(
+  isHidden: () => boolean,
+  getTheme: () => ThemeLike | undefined,
+  getReviewDiffs: (toolCallId: string) => ReviewFileDiff[] | undefined,
+) {
   const prototype = ToolExecutionComponent.prototype as PatchedToolExecutionPrototype;
   prototype[SHOULD_HIDE] = isHidden;
   prototype[GET_THEME] = getTheme;
+  prototype[GET_REVIEW_DIFFS] = getReviewDiffs;
 
   if (prototype[ORIGINAL_RENDER]) return;
 
@@ -307,15 +442,53 @@ function updateWorkingMessage(ctx: ExtensionContext, activeToolCalls: Set<string
   ctx.ui.setWorkingMessage(`Working · ${activeToolCalls.size} ${suffix}`);
 }
 
+async function captureSnapshot(toolName: string, toolCallId: string, input: Record<string, unknown>, ctx: ExtensionContext) {
+  const paths = mutationPaths(toolName, input, ctx.cwd);
+  if (paths.length === 0) return null;
+
+  const before = new Map<string, string | null>();
+  for (const filePath of paths) {
+    before.set(filePath, await readTextFileIfExists(filePath));
+  }
+  return { toolCallId, snapshot: { paths, before } };
+}
+
+async function buildReviewDiffs(snapshot: FileSnapshot): Promise<ReviewFileDiff[]> {
+  const files: ReviewFileDiff[] = [];
+  for (const filePath of snapshot.paths) {
+    const oldText = snapshot.before.get(filePath) ?? '';
+    const newText = (await readTextFileIfExists(filePath)) ?? '';
+    if (oldText === newText) continue;
+    const rows = buildReviewRows(oldText, newText);
+    if (rows.length > 0) files.push({ path: filePath, rows });
+  }
+  return files;
+}
+
 export default function toolDisplay(pi: ExtensionAPI) {
   let hideCollapsedTools = false;
   let currentTheme: ThemeLike | undefined;
   const activeToolCalls = new Set<string>();
+  const snapshots = new Map<string, FileSnapshot>();
+  const reviewDiffs = new Map<string, ReviewFileDiff[]>();
 
   installToolRenderPatch(
     () => hideCollapsedTools,
     () => currentTheme,
+    (toolCallId) => reviewDiffs.get(toolCallId),
   );
+
+  pi.on('tool_call', async (event, ctx) => {
+    const toolName = baseToolName(event.toolName);
+    if (!FILE_MUTATION_TOOLS.has(toolName)) return;
+
+    try {
+      const captured = await captureSnapshot(toolName, event.toolCallId, event.input, ctx);
+      if (captured) snapshots.set(captured.toolCallId, captured.snapshot);
+    } catch (error) {
+      ctx.ui.notify(`Tool display snapshot failed: ${error instanceof Error ? error.message : String(error)}`, 'warning');
+    }
+  });
 
   pi.on('tool_execution_start', (event, ctx) => {
     currentTheme = ctx.ui.theme;
@@ -323,9 +496,19 @@ export default function toolDisplay(pi: ExtensionAPI) {
     updateWorkingMessage(ctx, activeToolCalls);
   });
 
-  pi.on('tool_execution_end', (event, ctx) => {
+  pi.on('tool_execution_end', async (event, ctx) => {
     currentTheme = ctx.ui.theme;
     activeToolCalls.delete(event.toolCallId);
+    const snapshot = snapshots.get(event.toolCallId);
+    if (snapshot) {
+      try {
+        const files = await buildReviewDiffs(snapshot);
+        if (files.length > 0) reviewDiffs.set(event.toolCallId, files);
+      } catch (error) {
+        ctx.ui.notify(`Tool display diff failed: ${error instanceof Error ? error.message : String(error)}`, 'warning');
+      }
+      snapshots.delete(event.toolCallId);
+    }
     updateWorkingMessage(ctx, activeToolCalls);
   });
 
