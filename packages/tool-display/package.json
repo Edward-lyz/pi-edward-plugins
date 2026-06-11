@@ -1,7 +1,7 @@
 {
   "name": "pi-tool-display",
   "version": "0.1.0",
-  "description": "Hide collapsed Pi tool rows and show full details only on expansion",
+  "description": "Show compact Pi tool summaries and keep mutation diffs visible",
   "type": "module",
   "private": true,
   "keywords": [
