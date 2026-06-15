@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { ToolExecutionComponent } from '@earendil-works/pi-coding-agent';
-import { truncateToWidth } from '@earendil-works/pi-tui';
+import { truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
 import { structuredPatch } from 'diff';
 import { readFile } from 'node:fs/promises';
 import * as os from 'node:os';
@@ -85,6 +85,12 @@ function resolveFilePath(rawPath: string, cwd: string): string {
 function fitCell(text: string, width: number): string {
   const normalized = text.replace(/\t/g, '   ');
   return truncateToWidth(normalized, width, '…', true);
+}
+
+function fitRenderedLine(line: string, width: number): string {
+  const safeWidth = Math.max(0, width);
+  if (visibleWidth(line) <= safeWidth) return line;
+  return truncateToWidth(line, safeWidth, '…');
 }
 
 function firstString(...values: unknown[]): string {
@@ -303,10 +309,12 @@ function buildReviewRows(oldText: string, newText: string): DiffRow[] {
 }
 
 function renderReviewDiff(title: string, files: ReviewFileDiff[], width: number, t: ThemeLike, cwd?: string): string[] {
+  if (width <= 0) return [''];
+  const safeWidth = width;
   const maxLine = Math.max(1, ...files.flatMap((file) => file.rows.flatMap((row) => [row.oldNumber ?? 0, row.newNumber ?? 0])));
   const gutterWidth = Math.max(3, String(maxLine).length);
-  const columnWidth = Math.max(8, Math.floor((width - 11 - gutterWidth * 2) / 2));
-  const fullWidthText = Math.max(1, width - 2);
+  const columnWidth = Math.max(1, Math.floor((safeWidth - 11 - gutterWidth * 2) / 2));
+  const fullWidthText = Math.max(1, safeWidth - 2);
   const lines = [`  ${t.fg('toolTitle', truncateToWidth(title, fullWidthText, '…'))}`];
 
   for (const file of files) {
@@ -330,7 +338,7 @@ function renderReviewDiff(title: string, files: ReviewFileDiff[], width: number,
     }
   }
 
-  return ['', ...lines.map((line) => truncateToWidth(line, width, '…'))];
+  return ['', ...lines.map((line) => fitRenderedLine(line, safeWidth))];
 }
 
 function renderSideBySideDiff(title: string, diffText: string, width: number, t: ThemeLike, cwd?: string): string[] {
@@ -393,19 +401,22 @@ function prototypeReviewDiffs(toolCallId: string | undefined): ReviewFileDiff[] 
   return prototype[GET_REVIEW_DIFFS]?.(toolCallId);
 }
 
-function renderInlineSummary(instance: ToolExecutionInstance, t: ThemeLike): string {
+function renderInlineSummary(instance: ToolExecutionInstance, t: ThemeLike, width: number): string {
   const toolName = baseToolName(instance.toolName ?? '?');
   const icon = TOOL_ICONS[toolName] ?? '⚙';
   const argStr = formatArgs(toolName, instance.args);
   const arg = argStr ? `  ${t.fg('muted', argStr)}` : '';
 
+  let color = 'success';
+  let marker = '✔';
   if (!instance.result && instance.isPartial !== false) {
-    return `  ${t.fg('toolTitle', `⏺ ${icon} ${toolName}`)}${arg}`;
+    color = 'toolTitle';
+    marker = '⏺';
+  } else if (instance.result?.isError) {
+    color = 'error';
+    marker = '✗';
   }
-  if (instance.result?.isError) {
-    return `  ${t.fg('error', `✗ ${icon} ${toolName}`)}${arg}`;
-  }
-  return `  ${t.fg('success', `✔ ${icon} ${toolName}`)}${arg}`;
+  return fitRenderedLine(`  ${t.fg(color, `${marker} ${icon} ${toolName}`)}${arg}`, width);
 }
 
 function installToolRenderPatch(
@@ -429,7 +440,7 @@ function installToolRenderPatch(
     if (this.expanded) return originalRender.call(this, width);
     if (prototype[SHOULD_HIDE]?.()) return [];
     if (!t) return originalRender.call(this, width);
-    return ['', renderInlineSummary(this, t)];
+    return ['', renderInlineSummary(this, t, width)];
   };
 }
 
