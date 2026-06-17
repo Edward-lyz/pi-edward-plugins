@@ -39,9 +39,8 @@ type PatchFileOp = {
 type DiffRow = {
   oldNumber?: number;
   newNumber?: number;
-  left: string;
-  right: string;
-  kind: 'change' | 'context' | 'file';
+  text: string;
+  kind: 'add' | 'delete' | 'context' | 'file';
 };
 
 type ReviewFileDiff = {
@@ -245,51 +244,45 @@ async function readTextFileIfExists(filePath: string): Promise<string | null> {
 }
 
 function buildDiffRows(diffText: string): DiffRow[] {
-  const diffLines = diffText.split('\n');
-  const parsed = diffLines.map((line) => {
-    const fileMatch = line.match(/^\*\*\* (?:Update|Add|Delete) File: (.+)$/);
-    if (fileMatch?.[1]) return { kind: 'file' as const, text: fileMatch[1] };
-    if (line.startsWith('*** ') || line.startsWith('@@') || line.startsWith('diff --git') || line.startsWith('index ')) {
-      return { kind: 'skip' as const, text: '' };
-    }
-    if (line.startsWith('-') && !line.startsWith('---')) return { kind: 'remove' as const, text: stripDiffContent(line, '-') };
-    if (line.startsWith('+') && !line.startsWith('+++')) return { kind: 'add' as const, text: stripDiffContent(line, '+') };
-    if (line.startsWith(' ')) return { kind: 'context' as const, text: stripDiffContent(line, ' ') };
-    return { kind: 'skip' as const, text: '' };
-  });
-
   const rows: DiffRow[] = [];
-  for (let i = 0; i < parsed.length; i++) {
-    const current = parsed[i]!;
-    if (current.kind === 'skip') continue;
-    if (current.kind === 'file') {
-      rows.push({ left: current.text, right: '', kind: 'file' });
-      continue;
-    }
-    if (current.kind === 'context') {
-      rows.push({ left: current.text, right: current.text, kind: 'context' });
-      continue;
-    }
-    if (current.kind !== 'remove') {
-      rows.push({ left: '', right: current.text, kind: 'change' });
+  let oldNumber: number | undefined;
+  let newNumber: number | undefined;
+
+  for (const line of diffText.split('\n')) {
+    const fileMatch = line.match(/^\*\*\* (?:Update|Add|Delete) File: (.+)$/);
+    if (fileMatch?.[1]) {
+      rows.push({ kind: 'file', text: fileMatch[1] });
+      oldNumber = undefined;
+      newNumber = undefined;
       continue;
     }
 
-    const removed: string[] = [];
-    while (i < parsed.length && parsed[i]?.kind === 'remove') {
-      removed.push(parsed[i]!.text);
-      i++;
+    const hunkMatch = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    if (hunkMatch?.[1] && hunkMatch[2]) {
+      oldNumber = Number(hunkMatch[1]);
+      newNumber = Number(hunkMatch[2]);
+      continue;
     }
-    const added: string[] = [];
-    while (i < parsed.length && parsed[i]?.kind === 'add') {
-      added.push(parsed[i]!.text);
-      i++;
-    }
-    i--;
 
-    const pairCount = Math.max(removed.length, added.length);
-    for (let pairIndex = 0; pairIndex < pairCount; pairIndex++) {
-      rows.push({ left: removed[pairIndex] ?? '', right: added[pairIndex] ?? '', kind: 'change' });
+    if (line.startsWith('*** ') || line.startsWith('@@') || line.startsWith('diff --git') || line.startsWith('index ') || line.startsWith('--- ') || line.startsWith('+++ ')) continue;
+    if (line.startsWith('-')) {
+      const rowNumber = oldNumber;
+      if (oldNumber !== undefined) oldNumber++;
+      rows.push({ oldNumber: rowNumber, kind: 'delete', text: stripDiffContent(line, '-') });
+      continue;
+    }
+    if (line.startsWith('+')) {
+      const rowNumber = newNumber;
+      if (newNumber !== undefined) newNumber++;
+      rows.push({ newNumber: rowNumber, kind: 'add', text: stripDiffContent(line, '+') });
+      continue;
+    }
+    if (line.startsWith(' ')) {
+      const oldRowNumber = oldNumber;
+      const newRowNumber = newNumber;
+      if (oldNumber !== undefined) oldNumber++;
+      if (newNumber !== undefined) newNumber++;
+      rows.push({ oldNumber: oldRowNumber, newNumber: newRowNumber, kind: 'context', text: stripDiffContent(line, ' ') });
     }
   }
   return rows;
@@ -306,40 +299,20 @@ function buildReviewRows(oldText: string, newText: string): DiffRow[] {
       const line = hunk.lines[i]!;
       if (line.startsWith('\\')) continue;
       if (line.startsWith(' ')) {
-        rows.push({ oldNumber, newNumber, left: line.slice(1), right: line.slice(1), kind: 'context' });
+        rows.push({ oldNumber, newNumber, kind: 'context', text: line.slice(1) });
         oldNumber++;
         newNumber++;
         continue;
       }
-      if (!line.startsWith('-')) {
-        rows.push({ newNumber, left: '', right: line.slice(1), kind: 'change' });
-        newNumber++;
+      if (line.startsWith('-')) {
+        rows.push({ oldNumber, kind: 'delete', text: line.slice(1) });
+        oldNumber++;
         continue;
       }
-
-      const removed: Array<{ number: number; text: string }> = [];
-      while (i < hunk.lines.length && hunk.lines[i]?.startsWith('-')) {
-        removed.push({ number: oldNumber, text: hunk.lines[i]!.slice(1) });
-        oldNumber++;
-        i++;
-      }
-      const added: Array<{ number: number; text: string }> = [];
-      while (i < hunk.lines.length && hunk.lines[i]?.startsWith('+')) {
-        added.push({ number: newNumber, text: hunk.lines[i]!.slice(1) });
+      if (line.startsWith('+')) {
+        rows.push({ newNumber, kind: 'add', text: line.slice(1) });
         newNumber++;
-        i++;
-      }
-      i--;
-
-      const pairCount = Math.max(removed.length, added.length);
-      for (let pairIndex = 0; pairIndex < pairCount; pairIndex++) {
-        rows.push({
-          oldNumber: removed[pairIndex]?.number,
-          newNumber: added[pairIndex]?.number,
-          left: removed[pairIndex]?.text ?? '',
-          right: added[pairIndex]?.text ?? '',
-          kind: 'change',
-        });
+        continue;
       }
     }
   }
@@ -352,9 +325,8 @@ function reviewChangeStats(files: ReviewFileDiff[]): { additions: number; remova
   let removals = 0;
   for (const file of files) {
     for (const row of file.rows) {
-      if (row.kind !== 'change') continue;
-      if (row.left !== '') removals++;
-      if (row.right !== '') additions++;
+      if (row.kind === 'delete') removals++;
+      if (row.kind === 'add') additions++;
     }
   }
   return { additions, removals };
@@ -399,7 +371,7 @@ function renderReviewDiff(
   const safeWidth = width;
   const maxLine = Math.max(1, ...files.flatMap((file) => file.rows.flatMap((row) => [row.oldNumber ?? 0, row.newNumber ?? 0])));
   const gutterWidth = Math.max(3, String(maxLine).length);
-  const columnWidth = Math.max(1, Math.floor((safeWidth - 11 - gutterWidth * 2) / 2));
+  const codeWidth = Math.max(1, safeWidth - 10 - gutterWidth * 2);
   const fullWidthText = Math.max(1, safeWidth - 2);
   const titleColor = statusColor === 'error' ? 'error' : 'toolTitle';
   const lines = [`${t.fg(statusColor, '-')} ${t.fg(titleColor, truncateToWidth(title, fullWidthText, '…'))}`];
@@ -412,26 +384,22 @@ function renderReviewDiff(
       lines.push(`  ${t.fg('muted', `└ ${truncateToWidth(displayPath(file.path, cwd), fullWidthText - 3, '…')}`)}`);
     }
     for (const row of file.rows) {
+      if (row.kind === 'file') {
+        lines.push(`  ${t.fg('muted', `└ ${truncateToWidth(displayPath(row.text, cwd), fullWidthText - 3, '…')}`)}`);
+        continue;
+      }
       const oldNo = String(row.oldNumber ?? '').padStart(gutterWidth);
       const newNo = String(row.newNumber ?? '').padStart(gutterWidth);
-      const left = fitCell(row.left, columnWidth);
-      const right = fitCell(row.right, columnWidth);
-      if (row.kind === 'context') {
-        lines.push(`  ${t.fg('muted', `${oldNo} │ ${left} │ ${newNo} │ ${right}`)}`);
-        continue;
-      }
-      if (row.kind === 'file') {
-        lines.push(`  ${t.fg('muted', `└ ${truncateToWidth(displayPath(row.left, cwd), fullWidthText - 3, '…')}`)}`);
-        continue;
-      }
-      lines.push(`  ${t.fg('error', `${oldNo}−│ ${left}`)} │ ${t.fg('success', `${newNo}+│ ${right}`)}`);
+      const marker = row.kind === 'delete' ? '-' : row.kind === 'add' ? '+' : ' ';
+      const color = row.kind === 'delete' ? 'error' : row.kind === 'add' ? 'success' : 'muted';
+      lines.push(`  ${t.fg(color, `${oldNo} │ ${newNo} │ ${marker} ${fitCell(row.text, codeWidth)}`)}`);
     }
   }
 
   return ['', ...lines.map((line) => fitRenderedLine(line, safeWidth))];
 }
 
-function renderSideBySideDiff(title: string, diffText: string, width: number, t: ThemeLike, cwd?: string, statusColor = 'success'): string[] {
+function renderUnifiedDiff(title: string, diffText: string, width: number, t: ThemeLike, cwd?: string, statusColor = 'success'): string[] {
   return renderReviewDiff(title, [{ path: '', rows: buildDiffRows(diffText) }], width, t, cwd, statusColor);
 }
 
@@ -483,13 +451,13 @@ function renderMutationTool(instance: ToolExecutionInstance, width: number, t: T
     const reviewDiffs = prototypeReviewDiffs(instance.toolCallId);
     if (reviewDiffs?.length) return renderReviewDiff(title, reviewDiffs, width, t, instance.cwd, statusColor);
     const patchText = firstString(instance.args?.input, instance.args?.patch, instance.args?.diff);
-    if (patchText) return renderSideBySideDiff(title, patchText, width, t, instance.cwd, statusColor);
+    if (patchText) return renderUnifiedDiff(title, patchText, width, t, instance.cwd, statusColor);
   }
   if (toolName === 'edit') {
     const reviewDiffs = prototypeReviewDiffs(instance.toolCallId);
     if (reviewDiffs?.length) return renderReviewDiff(title, reviewDiffs, width, t, instance.cwd, statusColor);
     const diffText = typeof instance.result?.details?.diff === 'string' ? instance.result.details.diff : editDiffFromArgs(instance.args);
-    if (diffText) return renderSideBySideDiff(title, diffText, width, t, instance.cwd, statusColor);
+    if (diffText) return renderUnifiedDiff(title, diffText, width, t, instance.cwd, statusColor);
   }
   if (toolName === 'write') {
     const reviewDiffs = prototypeReviewDiffs(instance.toolCallId);
