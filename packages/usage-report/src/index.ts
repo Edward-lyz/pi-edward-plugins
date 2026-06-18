@@ -10,6 +10,7 @@ import {
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 const DEFAULT_PORT = 30143;
+const SERVER_VERSION = 1;
 const LITELLM_PRICE_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';
 const PRICE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
@@ -730,8 +731,15 @@ class UsageReportServer {
 }
 
 function getServer(): UsageReportServer {
-  const globalState = globalThis as typeof globalThis & { __piUsageReportServer?: UsageReportServer };
-  globalState.__piUsageReportServer ??= new UsageReportServer();
+  const globalState = globalThis as typeof globalThis & {
+    __piUsageReportServer?: UsageReportServer;
+    __piUsageReportServerVersion?: number;
+  };
+  if (!globalState.__piUsageReportServer || globalState.__piUsageReportServerVersion !== SERVER_VERSION) {
+    globalState.__piUsageReportServer?.stop();
+    globalState.__piUsageReportServer = new UsageReportServer();
+    globalState.__piUsageReportServerVersion = SERVER_VERSION;
+  }
   return globalState.__piUsageReportServer;
 }
 
