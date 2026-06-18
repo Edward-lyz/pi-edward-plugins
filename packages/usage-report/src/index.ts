@@ -889,7 +889,7 @@ function renderNotices(report) {
   const notices = [];
   if (report.pricing.status !== 'ok') notices.push('LiteLLM 价格源不可用：' + report.pricing.error);
   if (report.totals.unknownCostMessages || report.totals.partialUnknownCostMessages) notices.push('存在无法定价的模型消息：unknown=' + report.totals.unknownCostMessages + ', partial=' + report.totals.partialUnknownCostMessages + '。这些消息未按 0 美元处理。');
-  if (report.scanErrors.length) notices.push('扫描错误：\n' + report.scanErrors.slice(0, 20).join('\n'));
+  if (report.scanErrors.length) notices.push('扫描错误：\\n' + report.scanErrors.slice(0, 20).join('\\n'));
   document.getElementById('notices').innerHTML = notices.map((text) => '<div class="notice">' + escapeHtml(text) + '</div>').join('');
 }
 
