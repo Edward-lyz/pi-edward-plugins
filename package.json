@@ -45,7 +45,8 @@
       "packages/co-dev/src/index.ts",
       "packages/rtk/src/index.ts",
       "packages/statusline/src/index.ts",
-      "packages/system-context/src/index.ts"
+      "packages/system-context/src/index.ts",
+      "packages/usage-report/src/index.ts"
     ]
   }
 }
