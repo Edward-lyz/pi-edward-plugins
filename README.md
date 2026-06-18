@@ -24,8 +24,6 @@ pi -e .
 | `rtk` | `packages/rtk/src/index.ts` | Rewrites `bash` / `exec_command` commands through `rtk rewrite` before execution. | Requires `rtk` in `PATH`. |
 | `statusline` | `packages/statusline/src/index.ts` | Replaces the footer with model, context, cache-hit rate, TTFT, and output-rate info. | UI sessions only. |
 | `system-context` | `packages/system-context/src/index.ts` | Injects OS, shell, cwd, Node version, and a shallow directory tree into the system prompt. | Directory tree depth is intentionally small. |
-| `thinking-display` | `packages/thinking-display/src/index.ts` | Collapses thinking traces into one compact `thinking` marker. | Use `/thinking-display on\|off\|status`. |
-| `tool-display` | `packages/tool-display/src/index.ts` | Shows compact tool intent summaries, keeps file mutation tools expanded, and renders GitHub-style side-by-side diffs with context and line numbers. | Use `Ctrl+O` or `/tool-display expand`. |
 
 ## Load one extension
 
