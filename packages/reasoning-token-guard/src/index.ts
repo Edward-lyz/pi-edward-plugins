@@ -7,6 +7,7 @@ const MAX_TRANSPORT_RETRIES = 2;
 const GPT_MODEL_PATTERN = /^gpt/i;
 const GLOBAL_STATE_KEY = '__piBetterUxReasoningTokenGuard';
 const PATCH_VERSION = 4;
+const FORCE_SSE_ERROR_MESSAGE = 'reasoning-token-guard forces SSE transport for GPT replay';
 
 type ReasoningTokenMeasurement = {
 	tokens: number;
@@ -371,7 +372,7 @@ function installWebSocketCapture(state: RawCaptureState): void {
 			},
 			send(data: string) {
 				if (parseGuardedPayload(data)) {
-					throw new Error('reasoning-token-guard forces SSE transport for GPT replay');
+					throw new Error(FORCE_SSE_ERROR_MESSAGE);
 				}
 				socket.send(data);
 			},
@@ -416,7 +417,7 @@ function patchWebSocketPrototype(prototype: PatchedWebSocketPrototype, state: Ra
 	prototype.__reasoningTokenGuardAddEventListener = originalAddEventListener;
 	prototype.send = function (this: WebSocketLike, data: string): void {
 		if (parseGuardedPayload(data)) {
-			throw new Error('reasoning-token-guard forces SSE transport for GPT replay');
+			throw new Error(FORCE_SSE_ERROR_MESSAGE);
 		}
 		return originalSend.call(this, data);
 	};
@@ -530,11 +531,25 @@ function buildBlockedText(message: AssistantMessage, measurement: ReasoningToken
 	].join('\n');
 }
 
+function withoutExpectedForcedSseDiagnostic(message: AssistantMessage): { message: AssistantMessage; changed: boolean } {
+	const diagnostics = message.diagnostics;
+	if (!diagnostics) return { message, changed: false };
+
+	const keptDiagnostics = diagnostics.filter((diagnostic) => diagnostic.error?.message !== FORCE_SSE_ERROR_MESSAGE);
+	if (keptDiagnostics.length === diagnostics.length) return { message, changed: false };
+	if (keptDiagnostics.length > 0) {
+		return { message: { ...message, diagnostics: keptDiagnostics }, changed: true };
+	}
+
+	const { diagnostics: _diagnostics, ...messageWithoutDiagnostics } = message;
+	return { message: messageWithoutDiagnostics as AssistantMessage, changed: true };
+}
+
 function notifyUnavailableOnce(ctx: ExtensionContext, warned: { value: boolean }): void {
 	if (warned.value || !ctx.hasUI) return;
 	warned.value = true;
 	ctx.ui.notify(
-		'reasoning-token-guard: provider did not expose real reasoning tokens; gating disabled for this message.',
+		'reasoning-token-guard: real reasoning tokens unavailable; no replay/block applied.',
 		'warning',
 	);
 }
@@ -550,7 +565,7 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 	pi.on('message_end', (event, ctx) => {
 		if (event.message.role !== 'assistant') return;
 
-		const message = event.message as AssistantMessage;
+		const { message, changed: diagnosticsChanged } = withoutExpectedForcedSseDiagnostic(event.message as AssistantMessage);
 		if (!isTrackedModel(message)) return;
 
 		const measurement = getReasoningTokens(message, rawCaptureState);
@@ -590,7 +605,7 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 
 		if (!measurement) {
 			if (isFinalReply(message)) notifyUnavailableOnce(ctx, warnedUnavailable);
-			return;
+			return diagnosticsChanged ? { message } : undefined;
 		}
 
 		const messageWithReasoningTokens = withReasoningTokens(message, measurement);
