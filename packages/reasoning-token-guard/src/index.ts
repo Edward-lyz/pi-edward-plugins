@@ -65,6 +65,14 @@ type WebSocketLike = {
 
 type WebSocketConstructorLike = new (url: string | URL, options?: unknown) => WebSocketLike;
 
+type PatchedWebSocketPrototype = {
+	send?: (data: string) => void;
+	addEventListener?: (type: string, listener: (event: unknown) => void) => void;
+	__reasoningTokenGuardVersion?: number;
+	__reasoningTokenGuardSend?: (data: string) => void;
+	__reasoningTokenGuardAddEventListener?: (type: string, listener: (event: unknown) => void) => void;
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null;
 }
@@ -285,6 +293,7 @@ function installWebSocketCapture(state: RawCaptureState): void {
 	const globalScope = globalThis as unknown as { WebSocket?: WebSocketConstructorLike };
 	const OriginalWebSocket = globalScope.WebSocket;
 	if (!OriginalWebSocket) return;
+	patchWebSocketPrototypeChain(OriginalWebSocket, state);
 
 	const WrappedWebSocket = function (this: unknown, url: string | URL, options?: unknown): WebSocketLike {
 		const socket = new OriginalWebSocket(url, options);
@@ -331,7 +340,53 @@ function installWebSocketCapture(state: RawCaptureState): void {
 	WrappedWebSocket.prototype = OriginalWebSocket.prototype;
 	Object.setPrototypeOf(WrappedWebSocket, OriginalWebSocket);
 	globalScope.WebSocket = WrappedWebSocket;
+	patchWebSocketPrototypeChain(WrappedWebSocket, state);
 	state.webSocketPatched = true;
+}
+
+function patchWebSocketPrototypeChain(WebSocketCtor: WebSocketConstructorLike, state: RawCaptureState): void {
+	let current: unknown = WebSocketCtor;
+	while (typeof current === 'function' && current !== Function.prototype) {
+		const prototype = (current as { prototype?: PatchedWebSocketPrototype }).prototype;
+		if (prototype) patchWebSocketPrototype(prototype, state);
+		current = Object.getPrototypeOf(current);
+	}
+}
+
+function patchWebSocketPrototype(prototype: PatchedWebSocketPrototype, state: RawCaptureState): void {
+	if (prototype.__reasoningTokenGuardVersion === PATCH_VERSION) return;
+	const originalSend = prototype.__reasoningTokenGuardSend ?? prototype.send;
+	const originalAddEventListener = prototype.__reasoningTokenGuardAddEventListener ?? prototype.addEventListener;
+	if (!originalSend || !originalAddEventListener) return;
+
+	prototype.__reasoningTokenGuardSend = originalSend;
+	prototype.__reasoningTokenGuardAddEventListener = originalAddEventListener;
+	prototype.send = function (this: WebSocketLike, data: string): void {
+		if (parseGuardedPayload(data)) {
+			throw new Error('reasoning-token-guard forces SSE transport for GPT replay');
+		}
+		return originalSend.call(this, data);
+	};
+	prototype.addEventListener = function (this: WebSocketLike, type: string, listener: (event: unknown) => void): void {
+		if (type === 'message') installWebSocketMessageObserver(this, state, originalAddEventListener);
+		return originalAddEventListener.call(this, type, listener);
+	};
+	prototype.__reasoningTokenGuardVersion = PATCH_VERSION;
+}
+
+function installWebSocketMessageObserver(
+	socket: WebSocketLike & { __reasoningTokenGuardObserved?: boolean },
+	state: RawCaptureState,
+	addEventListener: (type: string, listener: (event: unknown) => void) => void,
+): void {
+	if (socket.__reasoningTokenGuardObserved) return;
+	socket.__reasoningTokenGuardObserved = true;
+	addEventListener.call(socket, 'message', (event: unknown) => {
+		if (!isRecord(event) || typeof event.data !== 'string') return;
+		const summary = createRawStreamSummary();
+		updateRawStreamSummary(summary, JSON.parse(event.data));
+		if (summary.responseId && summary.measurement) recordRawResponse(state, summary, []);
+	});
 }
 
 function installRawReasoningTokenCapture(): RawCaptureState {
