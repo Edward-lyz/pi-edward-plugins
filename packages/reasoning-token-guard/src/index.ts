@@ -4,6 +4,7 @@ import {
 	registerApiProvider,
 	type Api,
 	type AssistantMessage,
+	type AssistantMessageEvent,
 	type AssistantMessageEventStream,
 	type Context,
 	type Model,
@@ -17,12 +18,18 @@ const MIN_REASONING_TOKENS = 516;
 const MAX_TRANSPORT_RETRIES = 2;
 const GPT_MODEL_PATTERN = /^gpt/i;
 const GLOBAL_STATE_KEY = '__piBetterUxReasoningTokenGuard';
-const PATCH_VERSION = 5;
+const PATCH_VERSION = 6;
 const FORCE_SSE_ERROR_MESSAGE = 'reasoning-token-guard forces SSE transport for GPT replay';
+const VISIBLE_THINKING_TOKENIZER = 'generic-visible-v1';
+const WHITESPACE_PATTERN = /\s/u;
+const LETTER_OR_NUMBER_PATTERN = /[\p{Letter}\p{Number}]/u;
 
 type ReasoningTokenMeasurement = {
 	tokens: number;
 	source: string;
+	kind: 'real' | 'visibleThinkingFallback';
+	visibleThinkingChars?: number;
+	visibleThinkingTokenizer?: string;
 };
 
 type RawRetryInfo = {
@@ -41,6 +48,10 @@ type ReasoningTokenAudit = {
 	threshold: number;
 	reasoningTokens?: number;
 	reasoningTokenSource?: string;
+	reasoningTokenKind?: ReasoningTokenMeasurement['kind'];
+	visibleThinkingChars?: number;
+	visibleThinkingTokens?: number;
+	visibleThinkingTokenizer?: string;
 	reasoningTokenAvailable: boolean;
 	outputTokens: number;
 	totalTokens: number;
@@ -112,6 +123,15 @@ function readNumber(root: unknown, path: string[]): number | undefined {
 	return typeof current === 'number' && Number.isFinite(current) ? current : undefined;
 }
 
+function readString(root: unknown, path: string[]): string | undefined {
+	let current = root;
+	for (const key of path) {
+		if (!isRecord(current)) return undefined;
+		current = current[key];
+	}
+	return typeof current === 'string' ? current : undefined;
+}
+
 function getRawCaptureState(): RawCaptureState {
 	const globalScope = globalThis as typeof globalThis & {
 		[GLOBAL_STATE_KEY]?: Partial<RawCaptureState>;
@@ -141,7 +161,7 @@ function extractReasoningMeasurement(value: unknown, sourcePrefix: string): Reas
 
 	for (const [source, path] of candidates) {
 		const tokens = readNumber(value, path);
-		if (tokens !== undefined) return { tokens, source: `${sourcePrefix}.${source}` };
+		if (tokens !== undefined) return { tokens, source: `${sourcePrefix}.${source}`, kind: 'real' };
 	}
 
 	return undefined;
@@ -305,10 +325,10 @@ function shouldReplayRawResponse(response: Response, summary: RawStreamSummary):
 		&& summary.measurement.tokens < MIN_REASONING_TOKENS;
 }
 
-function notifyReplay(state: RawCaptureState, guardedPayload: Record<string, unknown>, attempt: number, tokens: number): void {
-	const model = typeof guardedPayload.model === 'string' ? guardedPayload.model : 'gpt';
+function notifyReplay(state: RawCaptureState, model: string, attempt: number, measurement: ReasoningTokenMeasurement): void {
+	const tokenLabel = measurement.kind === 'visibleThinkingFallback' ? 'visible thinking tokens' : 'reasoning tokens';
 	state.notify?.(
-		`reasoning-token-guard: ${model} reasoning tokens ${tokens} < ${MIN_REASONING_TOKENS}; replaying ${attempt}/${MAX_TRANSPORT_RETRIES}`,
+		`reasoning-token-guard: ${model} ${tokenLabel} ${measurement.tokens} < ${MIN_REASONING_TOKENS}; replaying ${attempt}/${MAX_TRANSPORT_RETRIES}`,
 		'warning',
 	);
 }
@@ -345,11 +365,13 @@ function installFetchCapture(state: RawCaptureState): void {
 			if (!response.body || !shouldObserveResponse(response)) return response;
 
 			const { body, summary } = await bufferSseResponse(response);
-			if (shouldReplayRawResponse(response, summary)
+			if (summary.measurement
+				&& shouldReplayRawResponse(response, summary)
 				&& rejectedReasoningTokens.length < MAX_TRANSPORT_RETRIES) {
-				const reasoningTokens = summary.measurement?.tokens ?? 0;
-				rejectedReasoningTokens.push(reasoningTokens);
-				notifyReplay(state, guardedPayload, rejectedReasoningTokens.length, reasoningTokens);
+				const measurement = summary.measurement;
+				const model = typeof guardedPayload.model === 'string' ? guardedPayload.model : 'gpt';
+				rejectedReasoningTokens.push(measurement.tokens);
+				notifyReplay(state, model, rejectedReasoningTokens.length, measurement);
 				continue;
 			}
 
@@ -429,8 +451,8 @@ function installCodexProviderUsagePatch(state: RawCaptureState): void {
 		: currentProvider;
 	const wrappedProvider: CodexApiProviderLike = {
 		api: 'openai-codex-responses',
-		stream: (model, context, options) => wrapCodexProviderStream(baseProvider.stream(model, context, options), state),
-		streamSimple: (model, context, options) => wrapCodexProviderStream(baseProvider.streamSimple(model, context, options), state),
+		stream: (model, context, options) => wrapCodexProviderStream(() => baseProvider.stream(model, context, options), state),
+		streamSimple: (model, context, options) => wrapCodexProviderStream(() => baseProvider.streamSimple(model, context, options), state),
 	};
 
 	registerApiProvider(wrappedProvider, ENTRY_TYPE);
@@ -440,38 +462,95 @@ function installCodexProviderUsagePatch(state: RawCaptureState): void {
 }
 
 function wrapCodexProviderStream(
-	innerStream: AssistantMessageEventStream,
+	createInnerStream: () => AssistantMessageEventStream,
 	state: RawCaptureState,
 ): AssistantMessageEventStream {
 	const outerStream = createAssistantMessageEventStream();
 	void (async () => {
-		try {
-			for await (const event of innerStream) {
-				if (event.type === 'done' && event.message.role === 'assistant') {
-					const message = withCapturedReasoningTokens(event.message, state);
-					outerStream.push({ ...event, message });
-					continue;
+		const rejectedReasoningTokens: number[] = [];
+		while (true) {
+			const events: AssistantMessageEvent[] = [];
+			let finalMessage: AssistantMessage | undefined;
+			let finalMeasurement: ReasoningTokenMeasurement | undefined;
+
+			try {
+				for await (const event of createInnerStream()) {
+					if (event.type === 'done' && event.message.role === 'assistant') {
+						const message = withTerminalReasoningTokens(event.message, state);
+						finalMessage = message;
+						finalMeasurement = getReasoningTokens(message, state);
+						events.push({ ...event, message });
+						continue;
+					}
+					if (event.type === 'error' && event.error.role === 'assistant') {
+						const error = withTerminalReasoningTokens(event.error, state);
+						finalMessage = error;
+						finalMeasurement = getReasoningTokens(error, state);
+						events.push({ ...event, error });
+						continue;
+					}
+					events.push(event);
 				}
-				if (event.type === 'error' && event.error.role === 'assistant') {
-					const error = withCapturedReasoningTokens(event.error, state);
-					outerStream.push({ ...event, error });
-					continue;
-				}
-				outerStream.push(event);
+			} catch (error) {
+				events.push({
+					type: 'error',
+					reason: 'error',
+					error: error instanceof Error
+						? createProviderPatchErrorMessage(error)
+						: createProviderPatchErrorMessage(new Error(String(error))),
+				});
 			}
+
+			if (finalMessage && finalMeasurement
+				&& shouldReplayProviderMessage(finalMessage, finalMeasurement)
+				&& rejectedReasoningTokens.length < MAX_TRANSPORT_RETRIES) {
+				rejectedReasoningTokens.push(finalMeasurement.tokens);
+				notifyReplay(state, finalMessage.model, rejectedReasoningTokens.length, finalMeasurement);
+				continue;
+			}
+
+			recordProviderRetry(state, finalMessage, finalMeasurement, rejectedReasoningTokens);
+			for (const event of events) outerStream.push(event);
 			outerStream.end();
-		} catch (error) {
-			outerStream.push({
-				type: 'error',
-				reason: 'error',
-				error: error instanceof Error
-					? createProviderPatchErrorMessage(error)
-					: createProviderPatchErrorMessage(new Error(String(error))),
-			});
-			outerStream.end();
+			return;
 		}
 	})();
 	return outerStream;
+}
+
+function withTerminalReasoningTokens(
+	message: AssistantMessage,
+	rawCaptureState: RawCaptureState,
+): AssistantMessage {
+	const capturedMessage = withCapturedReasoningTokens(message, rawCaptureState);
+	const measurement = getReasoningTokens(capturedMessage, rawCaptureState);
+	return measurement ? withReasoningTokens(capturedMessage, measurement) : capturedMessage;
+}
+
+function shouldReplayProviderMessage(
+	message: AssistantMessage,
+	measurement: ReasoningTokenMeasurement,
+): boolean {
+	return isFinalReply(message)
+		&& measurement.tokens < MIN_REASONING_TOKENS;
+}
+
+function recordProviderRetry(
+	state: RawCaptureState,
+	message: AssistantMessage | undefined,
+	measurement: ReasoningTokenMeasurement | undefined,
+	rejectedReasoningTokens: number[],
+): void {
+	if (!message?.responseId || rejectedReasoningTokens.length === 0) return;
+	const existingRetry = state.retryByResponseId.get(message.responseId);
+	state.retryByResponseId.set(message.responseId, {
+		attempts: (existingRetry?.attempts ?? 0) + rejectedReasoningTokens.length,
+		rejectedReasoningTokens: [
+			...(existingRetry?.rejectedReasoningTokens ?? []),
+			...rejectedReasoningTokens,
+		],
+		...(measurement ? { finalReasoningTokens: measurement.tokens } : {}),
+	});
 }
 
 function createProviderPatchErrorMessage(error: Error): AssistantMessage {
@@ -580,16 +659,98 @@ function extractMessageReasoningTokens(message: AssistantMessage): ReasoningToke
 		['details.reasoningTokens', ['details', 'reasoningTokens']],
 		['details.reasoning_tokens', ['details', 'reasoning_tokens']],
 	];
+	const recordedSource = readString(message, ['usage', 'reasoningTokenSource']);
+	const visibleThinkingChars = readNumber(message, ['usage', 'visibleThinkingChars']);
+	const visibleThinkingTokenizer = readString(message, ['usage', 'visibleThinkingTokenizer']);
 
 	for (const [source, path] of candidates) {
 		const tokens = readNumber(message, path);
-		if (tokens !== undefined) return { tokens, source };
+		if (tokens === undefined) continue;
+		if (recordedSource?.startsWith('visibleThinking.')) {
+			return {
+				tokens,
+				source: recordedSource,
+				kind: 'visibleThinkingFallback',
+				...(visibleThinkingChars !== undefined ? { visibleThinkingChars } : {}),
+				...(visibleThinkingTokenizer ? { visibleThinkingTokenizer } : {}),
+			};
+		}
+		return { tokens, source: recordedSource ?? source, kind: 'real' };
 	}
 
 	return undefined;
 }
 
-function getReasoningTokens(
+function isCjkCodePoint(codePoint: number): boolean {
+	return (codePoint >= 0x3400 && codePoint <= 0x4dbf)
+		|| (codePoint >= 0x4e00 && codePoint <= 0x9fff)
+		|| (codePoint >= 0xf900 && codePoint <= 0xfaff)
+		|| (codePoint >= 0x3040 && codePoint <= 0x30ff)
+		|| (codePoint >= 0xac00 && codePoint <= 0xd7af)
+		|| (codePoint >= 0x20000 && codePoint <= 0x2fa1f);
+}
+
+function isAsciiLetterOrNumber(codePoint: number): boolean {
+	return (codePoint >= 0x30 && codePoint <= 0x39)
+		|| (codePoint >= 0x41 && codePoint <= 0x5a)
+		|| (codePoint >= 0x61 && codePoint <= 0x7a);
+}
+
+function countGenericVisibleThinkingTokens(text: string): number {
+	const encoder = new TextEncoder();
+	let tokens = 0;
+	let wordRun = '';
+	const flushWordRun = () => {
+		if (!wordRun) return;
+		tokens += Math.max(1, Math.ceil(encoder.encode(wordRun).byteLength / 4));
+		wordRun = '';
+	};
+
+	for (const char of text) {
+		if (WHITESPACE_PATTERN.test(char)) {
+			flushWordRun();
+			continue;
+		}
+
+		const codePoint = char.codePointAt(0);
+		if (codePoint === undefined) continue;
+		if (isCjkCodePoint(codePoint)) {
+			flushWordRun();
+			tokens += 1;
+			continue;
+		}
+		if (isAsciiLetterOrNumber(codePoint) || char === '\'') {
+			wordRun += char;
+			continue;
+		}
+		if (LETTER_OR_NUMBER_PATTERN.test(char)) {
+			wordRun += char;
+			continue;
+		}
+		flushWordRun();
+		tokens += 1;
+	}
+	flushWordRun();
+	return tokens;
+}
+
+function extractVisibleThinkingMeasurement(message: AssistantMessage): ReasoningTokenMeasurement | undefined {
+	const visibleThinkingText = message.content
+		.filter((content) => content.type === 'thinking' && !content.redacted && content.thinking.trim().length > 0)
+		.map((content) => content.type === 'thinking' ? content.thinking : '')
+		.join('\n');
+	if (!visibleThinkingText) return undefined;
+
+	return {
+		tokens: countGenericVisibleThinkingTokens(visibleThinkingText),
+		source: `visibleThinking.${VISIBLE_THINKING_TOKENIZER}`,
+		kind: 'visibleThinkingFallback',
+		visibleThinkingChars: visibleThinkingText.length,
+		visibleThinkingTokenizer: VISIBLE_THINKING_TOKENIZER,
+	};
+}
+
+function getRealReasoningTokens(
 	message: AssistantMessage,
 	rawCaptureState: RawCaptureState,
 ): ReasoningTokenMeasurement | undefined {
@@ -597,11 +758,19 @@ function getReasoningTokens(
 		?? (message.responseId ? rawCaptureState.byResponseId.get(message.responseId) : undefined);
 }
 
+function getReasoningTokens(
+	message: AssistantMessage,
+	rawCaptureState: RawCaptureState,
+): ReasoningTokenMeasurement | undefined {
+	return getRealReasoningTokens(message, rawCaptureState)
+		?? extractVisibleThinkingMeasurement(message);
+}
+
 function withCapturedReasoningTokens(
 	message: AssistantMessage,
 	rawCaptureState: RawCaptureState,
 ): AssistantMessage {
-	const measurement = getReasoningTokens(message, rawCaptureState);
+	const measurement = getRealReasoningTokens(message, rawCaptureState);
 	return measurement ? withReasoningTokens(message, measurement) : message;
 }
 
@@ -624,15 +793,23 @@ function withReasoningTokens(
 			...message.usage,
 			reasoningTokens: measurement.tokens,
 			reasoningTokenSource: measurement.source,
+			reasoningTokenKind: measurement.kind,
+			...(measurement.kind === 'visibleThinkingFallback' ? {
+				visibleThinkingTokens: measurement.tokens,
+				visibleThinkingChars: measurement.visibleThinkingChars,
+				visibleThinkingTokenizer: measurement.visibleThinkingTokenizer,
+			} : {}),
 		},
 	} as AssistantMessage;
 }
 
 function buildBlockedText(message: AssistantMessage, measurement: ReasoningTokenMeasurement, rawRetry: RawRetryInfo | undefined): string {
+	const tokenLabel = measurement.kind === 'visibleThinkingFallback' ? 'Visible thinking tokens' : 'Reasoning tokens';
 	return [
 		'Reasoning token guard blocked this assistant reply.',
 		`Model: ${message.provider}/${message.model}`,
-		`Reasoning tokens: ${measurement.tokens} < ${MIN_REASONING_TOKENS}`,
+		`${tokenLabel}: ${measurement.tokens} < ${MIN_REASONING_TOKENS}`,
+		`Source: ${measurement.source}`,
 		`Transport retries: ${rawRetry?.attempts ?? 0}/${MAX_TRANSPORT_RETRIES}`,
 	].join('\n');
 }
@@ -655,7 +832,7 @@ function notifyUnavailableOnce(ctx: ExtensionContext, warned: { value: boolean }
 	if (warned.value || !ctx.hasUI) return;
 	warned.value = true;
 	ctx.ui.notify(
-		'reasoning-token-guard: real reasoning tokens unavailable; no replay/block applied.',
+		'reasoning-token-guard: no real reasoning tokens or visible thinking text; no replay/block applied.',
 		'warning',
 	);
 }
@@ -691,6 +868,12 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 			...(measurement ? {
 				reasoningTokens: measurement.tokens,
 				reasoningTokenSource: measurement.source,
+				reasoningTokenKind: measurement.kind,
+				...(measurement.kind === 'visibleThinkingFallback' ? {
+					visibleThinkingTokens: measurement.tokens,
+					visibleThinkingChars: measurement.visibleThinkingChars,
+					visibleThinkingTokenizer: measurement.visibleThinkingTokenizer,
+				} : {}),
 			} : {}),
 			reasoningTokenAvailable: measurement !== undefined,
 			outputTokens: message.usage.output,
@@ -700,7 +883,9 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 			rejectedReasoningTokens: rawRetry?.rejectedReasoningTokens ?? [],
 			maxTransportRetries: MAX_TRANSPORT_RETRIES,
 			...(!measurement ? {
-				note: 'Real reasoning token field unavailable; output tokens are not used as a proxy.',
+				note: 'No real reasoning token field or visible thinking text; output tokens are not used as a proxy.',
+			} : measurement.kind === 'visibleThinkingFallback' ? {
+				note: 'Real reasoning token field unavailable; used visible thinking with a generic tokenizer fallback.',
 			} : {}),
 		});
 
@@ -721,8 +906,9 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 		}
 
 		if (ctx.hasUI) {
+			const tokenLabel = measurement.kind === 'visibleThinkingFallback' ? 'visible thinking tokens' : 'reasoning tokens';
 			ctx.ui.notify(
-				`reasoning-token-guard: blocked ${measurement.tokens} reasoning tokens`,
+				`reasoning-token-guard: blocked ${measurement.tokens} ${tokenLabel}`,
 				'error',
 			);
 		}
