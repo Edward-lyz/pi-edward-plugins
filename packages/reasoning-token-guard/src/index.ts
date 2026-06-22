@@ -18,7 +18,7 @@ const MIN_REASONING_TOKENS = 516;
 const MAX_TRANSPORT_RETRIES = 2;
 const GPT_MODEL_PATTERN = /^gpt/i;
 const GLOBAL_STATE_KEY = '__piBetterUxReasoningTokenGuard';
-const PATCH_VERSION = 7;
+const PATCH_VERSION = 6;
 const FORCE_SSE_ERROR_MESSAGE = 'reasoning-token-guard forces SSE transport for GPT replay';
 const VISIBLE_THINKING_TOKENIZER = 'generic-visible-v1';
 const WHITESPACE_PATTERN = /\s/u;
@@ -478,14 +478,14 @@ function wrapCodexProviderStream(
 					if (event.type === 'done' && event.message.role === 'assistant') {
 						const message = withTerminalReasoningTokens(event.message, state);
 						finalMessage = message;
-						finalMeasurement = getRealReasoningTokens(message, state);
+						finalMeasurement = getReasoningTokens(message, state);
 						events.push({ ...event, message });
 						continue;
 					}
 					if (event.type === 'error' && event.error.role === 'assistant') {
 						const error = withTerminalReasoningTokens(event.error, state);
 						finalMessage = error;
-						finalMeasurement = getRealReasoningTokens(error, state);
+						finalMeasurement = getReasoningTokens(error, state);
 						events.push({ ...event, error });
 						continue;
 					}
@@ -531,9 +531,7 @@ function shouldReplayProviderMessage(
 	message: AssistantMessage,
 	measurement: ReasoningTokenMeasurement,
 ): boolean {
-	return measurement.kind === 'real'
-		&& isTrackedModel(message)
-		&& isFinalReply(message)
+	return isFinalReply(message)
 		&& measurement.tokens < MIN_REASONING_TOKENS;
 }
 
