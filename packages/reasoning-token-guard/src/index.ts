@@ -6,7 +6,7 @@ const MIN_REASONING_TOKENS = 516;
 const MAX_TRANSPORT_RETRIES = 2;
 const GPT_MODEL_PATTERN = /^gpt/i;
 const GLOBAL_STATE_KEY = '__piBetterUxReasoningTokenGuard';
-const PATCH_VERSION = 3;
+const PATCH_VERSION = 4;
 
 type ReasoningTokenMeasurement = {
 	tokens: number;
@@ -44,6 +44,11 @@ type RawCaptureState = {
 	installed?: boolean;
 	fetchPatched: boolean;
 	webSocketPatched: boolean;
+	fetchOriginal?: typeof fetch;
+	fetchWrapped?: typeof fetch;
+	webSocketOriginal?: WebSocketConstructorLike;
+	webSocketWrapped?: WebSocketConstructorLike;
+	notify?: (message: string, level: 'info' | 'warning' | 'error') => void;
 	byResponseId: Map<string, ReasoningTokenMeasurement>;
 	retryByResponseId: Map<string, RawRetryInfo>;
 };
@@ -173,13 +178,30 @@ function observeSseText(summary: RawStreamSummary, buffer: { text: string }, tex
 }
 
 function parseJsonRecord(text: string): Record<string, unknown> | undefined {
-	const parsed = JSON.parse(text) as unknown;
-	return isRecord(parsed) ? parsed : undefined;
+	try {
+		const parsed = JSON.parse(text) as unknown;
+		return isRecord(parsed) ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
-function decodeBody(body: BodyInit | null | undefined): string | undefined {
+async function decodeBody(body: BodyInit | null | undefined): Promise<string | undefined> {
 	if (typeof body === 'string') return body;
 	if (body instanceof Uint8Array) return new TextDecoder().decode(body);
+	if (body instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(body));
+	if (typeof Blob !== 'undefined' && body instanceof Blob) return body.text();
+	return undefined;
+}
+
+async function decodeWebSocketData(data: unknown): Promise<string | undefined> {
+	if (typeof data === 'string') return data;
+	if (data instanceof ArrayBuffer) return new TextDecoder().decode(new Uint8Array(data));
+	if (ArrayBuffer.isView(data)) return new TextDecoder().decode(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+	if (isRecord(data) && typeof data.arrayBuffer === 'function') {
+		const arrayBuffer = await (data as { arrayBuffer: () => Promise<ArrayBuffer> }).arrayBuffer();
+		return new TextDecoder().decode(new Uint8Array(arrayBuffer));
+	}
 	return undefined;
 }
 
@@ -194,9 +216,16 @@ function parseGuardedPayload(payload: unknown): Record<string, unknown> | undefi
 	return body?.stream === true || body?.type === 'response.create' ? body : undefined;
 }
 
-function parseGuardedFetchBody(_input: RequestInfo | URL, init: RequestInit | undefined): Record<string, unknown> | undefined {
-	const requestBody = decodeBody(init?.body);
-	return requestBody ? parseGuardedPayload(requestBody) : undefined;
+async function parseGuardedFetchBody(input: RequestInfo | URL, init: RequestInit | undefined): Promise<Record<string, unknown> | undefined> {
+	const requestBody = await decodeBody(init?.body);
+	if (requestBody) return parseGuardedPayload(requestBody);
+
+	if (typeof Request !== 'undefined' && input instanceof Request) {
+		const inputBody = await input.clone().text();
+		return inputBody ? parseGuardedPayload(inputBody) : undefined;
+	}
+
+	return undefined;
 }
 
 function shouldObserveResponse(response: Response): boolean {
@@ -254,6 +283,22 @@ function shouldReplayRawResponse(response: Response, summary: RawStreamSummary):
 		&& summary.measurement.tokens < MIN_REASONING_TOKENS;
 }
 
+function notifyReplay(state: RawCaptureState, guardedPayload: Record<string, unknown>, attempt: number, tokens: number): void {
+	const model = typeof guardedPayload.model === 'string' ? guardedPayload.model : 'gpt';
+	state.notify?.(
+		`reasoning-token-guard: ${model} reasoning tokens ${tokens} < ${MIN_REASONING_TOKENS}; replaying ${attempt}/${MAX_TRANSPORT_RETRIES}`,
+		'warning',
+	);
+}
+
+function notifyReplayAccepted(ctx: ExtensionContext, rawRetry: RawRetryInfo | undefined, measurement: ReasoningTokenMeasurement): void {
+	if (!ctx.hasUI || !rawRetry || rawRetry.attempts === 0) return;
+	ctx.ui.notify(
+		`reasoning-token-guard: replay accepted; rejected ${rawRetry.rejectedReasoningTokens.join(', ')}; final ${measurement.tokens}`,
+		'info',
+	);
+}
+
 function bufferedResponse(response: Response, body: Uint8Array): Response {
 	const arrayBuffer = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer;
 	return new Response(arrayBuffer, {
@@ -264,10 +309,13 @@ function bufferedResponse(response: Response, body: Uint8Array): Response {
 }
 
 function installFetchCapture(state: RawCaptureState): void {
-	if (state.fetchPatched && state.patchVersion === PATCH_VERSION) return;
-	const originalFetch = globalThis.fetch;
+	if (globalThis.fetch === state.fetchWrapped && state.patchVersion === PATCH_VERSION) return;
+	const originalFetch = globalThis.fetch === state.fetchWrapped && state.fetchOriginal
+		? state.fetchOriginal
+		: globalThis.fetch;
 	globalThis.fetch = async (input, init) => {
-		if (!parseGuardedFetchBody(input, init)) return originalFetch(input, init);
+		const guardedPayload = await parseGuardedFetchBody(input, init);
+		if (!guardedPayload) return originalFetch(input, init);
 
 		const rejectedReasoningTokens: number[] = [];
 		while (true) {
@@ -277,7 +325,9 @@ function installFetchCapture(state: RawCaptureState): void {
 			const { body, summary } = await bufferSseResponse(response);
 			if (shouldReplayRawResponse(response, summary)
 				&& rejectedReasoningTokens.length < MAX_TRANSPORT_RETRIES) {
-				rejectedReasoningTokens.push(summary.measurement?.tokens ?? 0);
+				const reasoningTokens = summary.measurement?.tokens ?? 0;
+				rejectedReasoningTokens.push(reasoningTokens);
+				notifyReplay(state, guardedPayload, rejectedReasoningTokens.length, reasoningTokens);
 				continue;
 			}
 
@@ -285,29 +335,30 @@ function installFetchCapture(state: RawCaptureState): void {
 			return bufferedResponse(response, body);
 		}
 	};
+	state.fetchOriginal = originalFetch;
+	state.fetchWrapped = globalThis.fetch;
 	state.fetchPatched = true;
 }
 
 function installWebSocketCapture(state: RawCaptureState): void {
-	if (state.webSocketPatched && state.patchVersion === PATCH_VERSION) return;
 	const globalScope = globalThis as unknown as { WebSocket?: WebSocketConstructorLike };
 	const OriginalWebSocket = globalScope.WebSocket;
 	if (!OriginalWebSocket) return;
-	patchWebSocketPrototypeChain(OriginalWebSocket, state);
+	if (OriginalWebSocket === state.webSocketWrapped && state.patchVersion === PATCH_VERSION) return;
+	const BaseWebSocket = OriginalWebSocket === state.webSocketWrapped && state.webSocketOriginal
+		? state.webSocketOriginal
+		: OriginalWebSocket;
+	patchWebSocketPrototypeChain(BaseWebSocket, state);
 
 	const WrappedWebSocket = function (this: unknown, url: string | URL, options?: unknown): WebSocketLike {
-		const socket = new OriginalWebSocket(url, options);
+		const socket = new BaseWebSocket(url, options);
 		const listeners = new Map<string, Set<(event: unknown) => void>>();
 		const dispatch = (type: string, event: unknown) => {
 			for (const listener of listeners.get(type) ?? []) listener(event);
 		};
 
 		socket.addEventListener('message', (event: unknown) => {
-			if (isRecord(event) && typeof event.data === 'string') {
-				const summary = createRawStreamSummary();
-				updateRawStreamSummary(summary, JSON.parse(event.data));
-				if (summary.responseId && summary.measurement) recordRawResponse(state, summary, []);
-			}
+			observeWebSocketRawMessage(state, event);
 			dispatch('message', event);
 		});
 		socket.addEventListener('open', (event) => dispatch('open', event));
@@ -337,10 +388,12 @@ function installWebSocketCapture(state: RawCaptureState): void {
 			},
 		};
 	} as unknown as WebSocketConstructorLike;
-	WrappedWebSocket.prototype = OriginalWebSocket.prototype;
-	Object.setPrototypeOf(WrappedWebSocket, OriginalWebSocket);
+	WrappedWebSocket.prototype = BaseWebSocket.prototype;
+	Object.setPrototypeOf(WrappedWebSocket, BaseWebSocket);
 	globalScope.WebSocket = WrappedWebSocket;
 	patchWebSocketPrototypeChain(WrappedWebSocket, state);
+	state.webSocketOriginal = BaseWebSocket;
+	state.webSocketWrapped = WrappedWebSocket;
 	state.webSocketPatched = true;
 }
 
@@ -382,16 +435,32 @@ function installWebSocketMessageObserver(
 	if (socket.__reasoningTokenGuardObserved) return;
 	socket.__reasoningTokenGuardObserved = true;
 	addEventListener.call(socket, 'message', (event: unknown) => {
-		if (!isRecord(event) || typeof event.data !== 'string') return;
-		const summary = createRawStreamSummary();
-		updateRawStreamSummary(summary, JSON.parse(event.data));
-		if (summary.responseId && summary.measurement) recordRawResponse(state, summary, []);
+		observeWebSocketRawMessage(state, event);
 	});
+}
+
+function observeWebSocketRawMessage(state: RawCaptureState, event: unknown): void {
+	if (!isRecord(event)) return;
+	if (typeof event.data === 'string') {
+		recordWebSocketRawText(state, event.data);
+		return;
+	}
+	void decodeWebSocketData(event.data).then((text) => {
+		if (!text) return;
+		recordWebSocketRawText(state, text);
+	});
+}
+
+function recordWebSocketRawText(state: RawCaptureState, text: string): void {
+	const parsedEvent = parseJsonRecord(text);
+	if (!parsedEvent) return;
+	const summary = createRawStreamSummary();
+	updateRawStreamSummary(summary, parsedEvent);
+	if (summary.responseId && summary.measurement) recordRawResponse(state, summary, []);
 }
 
 function installRawReasoningTokenCapture(): RawCaptureState {
 	const state = getRawCaptureState();
-	if (state.installed && state.patchVersion === PATCH_VERSION) return state;
 	installFetchCapture(state);
 	installWebSocketCapture(state);
 	state.installed = true;
@@ -474,6 +543,10 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 	const rawCaptureState = installRawReasoningTokenCapture();
 	const warnedUnavailable = { value: false };
 
+	pi.on('before_provider_request', (_event, ctx) => {
+		rawCaptureState.notify = ctx.hasUI ? ctx.ui.notify.bind(ctx.ui) : undefined;
+	});
+
 	pi.on('message_end', (event, ctx) => {
 		if (event.message.role !== 'assistant') return;
 
@@ -521,6 +594,7 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 		}
 
 		const messageWithReasoningTokens = withReasoningTokens(message, measurement);
+		notifyReplayAccepted(ctx, rawRetry, measurement);
 		if (!blocked) return { message: messageWithReasoningTokens };
 
 		if (ctx.hasUI) {
