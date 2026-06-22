@@ -3,13 +3,19 @@ import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-a
 
 const ENTRY_TYPE = 'reasoning-token-guard';
 const MIN_REASONING_TOKENS = 516;
-const MAX_AUTO_RETRIES = 2;
+const MAX_TRANSPORT_RETRIES = 2;
 const GPT_MODEL_PATTERN = /^gpt/i;
 const GLOBAL_STATE_KEY = '__piBetterUxReasoningTokenGuard';
 
 type ReasoningTokenMeasurement = {
 	tokens: number;
 	source: string;
+};
+
+type RawRetryInfo = {
+	attempts: number;
+	rejectedReasoningTokens: number[];
+	finalReasoningTokens?: number;
 };
 
 type ReasoningTokenAudit = {
@@ -26,9 +32,9 @@ type ReasoningTokenAudit = {
 	outputTokens: number;
 	totalTokens: number;
 	blocked: boolean;
-	retryQueued: boolean;
-	retryAttempt: number;
-	maxRetries: number;
+	transportRetries: number;
+	rejectedReasoningTokens: number[];
+	maxTransportRetries: number;
 	note?: string;
 };
 
@@ -37,10 +43,22 @@ type RawCaptureState = {
 	fetchPatched: boolean;
 	webSocketPatched: boolean;
 	byResponseId: Map<string, ReasoningTokenMeasurement>;
+	retryByResponseId: Map<string, RawRetryInfo>;
+};
+
+type RawStreamSummary = {
+	responseId?: string;
+	measurement?: ReasoningTokenMeasurement;
+	hasToolCall: boolean;
+	terminal: boolean;
 };
 
 type WebSocketLike = {
+	readyState?: number;
+	send(data: string): void;
+	close(code?: number, reason?: string): void;
 	addEventListener(type: string, listener: (event: unknown) => void): void;
+	removeEventListener(type: string, listener: (event: unknown) => void): void;
 };
 
 type WebSocketConstructorLike = new (url: string | URL, options?: unknown) => WebSocketLike;
@@ -67,51 +85,68 @@ function getRawCaptureState(): RawCaptureState {
 		fetchPatched: false,
 		webSocketPatched: false,
 		byResponseId: new Map(),
+		retryByResponseId: new Map(),
 	};
 	return globalScope[GLOBAL_STATE_KEY];
 }
 
-function extractRawReasoningTokens(value: unknown): number | undefined {
-	const candidates = [
-		['usage', 'output_tokens_details', 'reasoning_tokens'],
-		['usage', 'completion_tokens_details', 'reasoning_tokens'],
-		['usage', 'reasoning_output_tokens'],
-		['usage', 'reasoning_tokens'],
-		['usage', 'reasoningTokens'],
-		['last_token_usage', 'reasoning_output_tokens'],
-		['total_token_usage', 'reasoning_output_tokens'],
+function extractReasoningMeasurement(value: unknown, sourcePrefix: string): ReasoningTokenMeasurement | undefined {
+	const candidates: Array<[string, string[]]> = [
+		['usage.output_tokens_details.reasoning_tokens', ['usage', 'output_tokens_details', 'reasoning_tokens']],
+		['usage.completion_tokens_details.reasoning_tokens', ['usage', 'completion_tokens_details', 'reasoning_tokens']],
+		['usage.reasoning_output_tokens', ['usage', 'reasoning_output_tokens']],
+		['usage.reasoning_tokens', ['usage', 'reasoning_tokens']],
+		['usage.reasoningTokens', ['usage', 'reasoningTokens']],
+		['last_token_usage.reasoning_output_tokens', ['last_token_usage', 'reasoning_output_tokens']],
+		['total_token_usage.reasoning_output_tokens', ['total_token_usage', 'reasoning_output_tokens']],
 	];
 
-	for (const path of candidates) {
+	for (const [source, path] of candidates) {
 		const tokens = readNumber(value, path);
-		if (tokens !== undefined) return tokens;
+		if (tokens !== undefined) return { tokens, source: `${sourcePrefix}.${source}` };
 	}
 
 	return undefined;
 }
 
-function captureRawEvent(state: RawCaptureState, event: unknown): void {
+function createRawStreamSummary(): RawStreamSummary {
+	return { hasToolCall: false, terminal: false };
+}
+
+function updateRawStreamSummary(summary: RawStreamSummary, event: unknown): void {
 	if (!isRecord(event)) return;
+
+	const eventType = typeof event.type === 'string' ? event.type : undefined;
+	const item = isRecord(event.item) ? event.item : undefined;
+	if ((eventType === 'response.output_item.added' || eventType === 'response.output_item.done')
+		&& item?.type === 'function_call') {
+		summary.hasToolCall = true;
+	}
+
 	const response = isRecord(event.response) ? event.response : undefined;
 	const responseId = typeof response?.id === 'string'
 		? response.id
 		: typeof event.id === 'string'
 			? event.id
 			: undefined;
-	if (!responseId) return;
+	if (responseId) summary.responseId = responseId;
 
-	const rawTokens = extractRawReasoningTokens(response ?? event);
-	if (rawTokens === undefined) return;
+	const measurement = extractReasoningMeasurement(
+		response ?? event,
+		response ? 'raw.response' : 'raw',
+	);
+	if (measurement) summary.measurement = measurement;
 
-	state.byResponseId.set(responseId, {
-		tokens: rawTokens,
-		source: response
-			? 'raw.response.usage.output_tokens_details.reasoning_tokens'
-			: 'raw.usage.completion_tokens_details.reasoning_tokens',
-	});
+	if (eventType === 'response.completed'
+		|| eventType === 'response.done'
+		|| eventType === 'response.incomplete'
+		|| eventType === 'response.failed'
+		|| eventType === 'error') {
+		summary.terminal = true;
+	}
 }
 
-function observeSseText(state: RawCaptureState, buffer: { text: string }, text: string): void {
+function observeSseText(summary: RawStreamSummary, buffer: { text: string }, text: string): void {
 	buffer.text += text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 	let separatorIndex = buffer.text.indexOf('\n\n');
 	while (separatorIndex !== -1) {
@@ -123,39 +158,123 @@ function observeSseText(state: RawCaptureState, buffer: { text: string }, text: 
 			.map((line) => line.slice(5).trim())
 			.join('\n')
 			.trim();
-		if (data && data !== '[DONE]') captureRawEvent(state, JSON.parse(data));
+		if (data && data !== '[DONE]') updateRawStreamSummary(summary, JSON.parse(data));
 		separatorIndex = buffer.text.indexOf('\n\n');
 	}
+}
+
+function parseJsonRecord(text: string): Record<string, unknown> | undefined {
+	const parsed = JSON.parse(text) as unknown;
+	return isRecord(parsed) ? parsed : undefined;
+}
+
+function decodeBody(body: BodyInit | null | undefined): string | undefined {
+	if (typeof body === 'string') return body;
+	if (body instanceof Uint8Array) return new TextDecoder().decode(body);
+	return undefined;
+}
+
+function parseGuardedPayload(payload: unknown): Record<string, unknown> | undefined {
+	const body = typeof payload === 'string'
+		? parseJsonRecord(payload)
+		: isRecord(payload)
+			? payload
+			: undefined;
+	const model = body?.model;
+	if (typeof model !== 'string' || !GPT_MODEL_PATTERN.test(model)) return undefined;
+	return body?.stream === true || body?.type === 'response.create' ? body : undefined;
+}
+
+function parseGuardedFetchBody(_input: RequestInfo | URL, init: RequestInit | undefined): Record<string, unknown> | undefined {
+	const requestBody = decodeBody(init?.body);
+	return requestBody ? parseGuardedPayload(requestBody) : undefined;
 }
 
 function shouldObserveResponse(response: Response): boolean {
 	return response.headers.get('content-type')?.toLowerCase().includes('text/event-stream') ?? false;
 }
 
+async function bufferSseResponse(response: Response): Promise<{ body: Uint8Array; summary: RawStreamSummary }> {
+	if (!response.body) throw new Error('Cannot buffer SSE response without body');
+
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	const decoder = new TextDecoder();
+	const sseBuffer = { text: '' };
+	const summary = createRawStreamSummary();
+	let totalLength = 0;
+
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			chunks.push(value);
+			totalLength += value.byteLength;
+			observeSseText(summary, sseBuffer, decoder.decode(value, { stream: true }));
+		}
+		const tail = decoder.decode();
+		if (tail) observeSseText(summary, sseBuffer, tail);
+	} finally {
+		reader.releaseLock();
+	}
+
+	const body = new Uint8Array(totalLength);
+	let offset = 0;
+	for (const chunk of chunks) {
+		body.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return { body, summary };
+}
+
+function recordRawResponse(state: RawCaptureState, summary: RawStreamSummary, rejectedReasoningTokens: number[]): void {
+	if (!summary.responseId) return;
+	if (summary.measurement) state.byResponseId.set(summary.responseId, summary.measurement);
+	state.retryByResponseId.set(summary.responseId, {
+		attempts: rejectedReasoningTokens.length,
+		rejectedReasoningTokens: [...rejectedReasoningTokens],
+		...(summary.measurement ? { finalReasoningTokens: summary.measurement.tokens } : {}),
+	});
+}
+
+function shouldReplayRawResponse(response: Response, summary: RawStreamSummary): boolean {
+	return response.ok
+		&& summary.terminal
+		&& !summary.hasToolCall
+		&& summary.measurement !== undefined
+		&& summary.measurement.tokens < MIN_REASONING_TOKENS;
+}
+
+function bufferedResponse(response: Response, body: Uint8Array): Response {
+	const arrayBuffer = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength) as ArrayBuffer;
+	return new Response(arrayBuffer, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers,
+	});
+}
+
 function installFetchCapture(state: RawCaptureState): void {
 	if (state.fetchPatched) return;
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (input, init) => {
-		const response = await originalFetch(input, init);
-		if (!response.body || !shouldObserveResponse(response)) return response;
+		if (!parseGuardedFetchBody(input, init)) return originalFetch(input, init);
 
-		const decoder = new TextDecoder();
-		const buffer = { text: '' };
-		const stream = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
-			transform(chunk, controller) {
-				observeSseText(state, buffer, decoder.decode(chunk, { stream: true }));
-				controller.enqueue(chunk);
-			},
-			flush() {
-				const tail = decoder.decode();
-				if (tail) observeSseText(state, buffer, tail);
-			},
-		}));
-		return new Response(stream, {
-			status: response.status,
-			statusText: response.statusText,
-			headers: response.headers,
-		});
+		const rejectedReasoningTokens: number[] = [];
+		while (true) {
+			const response = await originalFetch(input, init);
+			if (!response.body || !shouldObserveResponse(response)) return response;
+
+			const { body, summary } = await bufferSseResponse(response);
+			if (shouldReplayRawResponse(response, summary)
+				&& rejectedReasoningTokens.length < MAX_TRANSPORT_RETRIES) {
+				rejectedReasoningTokens.push(summary.measurement?.tokens ?? 0);
+				continue;
+			}
+
+			recordRawResponse(state, summary, rejectedReasoningTokens);
+			return bufferedResponse(response, body);
+		}
 	};
 	state.fetchPatched = true;
 }
@@ -168,11 +287,45 @@ function installWebSocketCapture(state: RawCaptureState): void {
 
 	const WrappedWebSocket = function (this: unknown, url: string | URL, options?: unknown): WebSocketLike {
 		const socket = new OriginalWebSocket(url, options);
+		const listeners = new Map<string, Set<(event: unknown) => void>>();
+		const dispatch = (type: string, event: unknown) => {
+			for (const listener of listeners.get(type) ?? []) listener(event);
+		};
+
 		socket.addEventListener('message', (event: unknown) => {
-			if (!isRecord(event) || typeof event.data !== 'string') return;
-			captureRawEvent(state, JSON.parse(event.data));
+			if (isRecord(event) && typeof event.data === 'string') {
+				const summary = createRawStreamSummary();
+				updateRawStreamSummary(summary, JSON.parse(event.data));
+				if (summary.responseId && summary.measurement) recordRawResponse(state, summary, []);
+			}
+			dispatch('message', event);
 		});
-		return socket;
+		socket.addEventListener('open', (event) => dispatch('open', event));
+		socket.addEventListener('error', (event) => dispatch('error', event));
+		socket.addEventListener('close', (event) => dispatch('close', event));
+
+		return {
+			get readyState() {
+				return socket.readyState;
+			},
+			send(data: string) {
+				if (parseGuardedPayload(data)) {
+					throw new Error('reasoning-token-guard forces SSE transport for GPT replay');
+				}
+				socket.send(data);
+			},
+			close(code?: number, reason?: string) {
+				socket.close(code, reason);
+			},
+			addEventListener(type: string, listener: (event: unknown) => void) {
+				const typeListeners = listeners.get(type) ?? new Set<(event: unknown) => void>();
+				typeListeners.add(listener);
+				listeners.set(type, typeListeners);
+			},
+			removeEventListener(type: string, listener: (event: unknown) => void) {
+				listeners.get(type)?.delete(listener);
+			},
+		};
 	} as unknown as WebSocketConstructorLike;
 	WrappedWebSocket.prototype = OriginalWebSocket.prototype;
 	Object.setPrototypeOf(WrappedWebSocket, OriginalWebSocket);
@@ -189,7 +342,7 @@ function installRawReasoningTokenCapture(): RawCaptureState {
 	return state;
 }
 
-function extractReasoningTokens(message: AssistantMessage): ReasoningTokenMeasurement | undefined {
+function extractMessageReasoningTokens(message: AssistantMessage): ReasoningTokenMeasurement | undefined {
 	const candidates: Array<[string, string[]]> = [
 		['usage.reasoningTokens', ['usage', 'reasoningTokens']],
 		['usage.reasoning_tokens', ['usage', 'reasoning_tokens']],
@@ -215,7 +368,7 @@ function getReasoningTokens(
 	message: AssistantMessage,
 	rawCaptureState: RawCaptureState,
 ): ReasoningTokenMeasurement | undefined {
-	return extractReasoningTokens(message)
+	return extractMessageReasoningTokens(message)
 		?? (message.responseId ? rawCaptureState.byResponseId.get(message.responseId) : undefined);
 }
 
@@ -242,20 +395,12 @@ function withReasoningTokens(
 	} as AssistantMessage;
 }
 
-function buildBlockedText(
-	message: AssistantMessage,
-	measurement: ReasoningTokenMeasurement,
-	retryQueued: boolean,
-	retryAttempt: number,
-): string {
-	const retryText = retryQueued
-		? `Queued retry ${retryAttempt}/${MAX_AUTO_RETRIES}.`
-		: `Max retries reached (${MAX_AUTO_RETRIES}).`;
+function buildBlockedText(message: AssistantMessage, measurement: ReasoningTokenMeasurement, rawRetry: RawRetryInfo | undefined): string {
 	return [
 		'Reasoning token guard blocked this assistant reply.',
 		`Model: ${message.provider}/${message.model}`,
 		`Reasoning tokens: ${measurement.tokens} < ${MIN_REASONING_TOKENS}`,
-		retryText,
+		`Transport retries: ${rawRetry?.attempts ?? 0}/${MAX_TRANSPORT_RETRIES}`,
 	].join('\n');
 }
 
@@ -270,12 +415,7 @@ function notifyUnavailableOnce(ctx: ExtensionContext, warned: { value: boolean }
 
 export default function reasoningTokenGuard(pi: ExtensionAPI) {
 	const rawCaptureState = installRawReasoningTokenCapture();
-	let retryAttempts = 0;
 	const warnedUnavailable = { value: false };
-
-	pi.on('input', (event) => {
-		if (event.source !== 'extension') retryAttempts = 0;
-	});
 
 	pi.on('message_end', (event, ctx) => {
 		if (event.message.role !== 'assistant') return;
@@ -284,11 +424,10 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 		if (!isTrackedModel(message)) return;
 
 		const measurement = getReasoningTokens(message, rawCaptureState);
+		const rawRetry = message.responseId ? rawCaptureState.retryByResponseId.get(message.responseId) : undefined;
 		const blocked = measurement !== undefined
 			&& isFinalReply(message)
 			&& measurement.tokens < MIN_REASONING_TOKENS;
-		const retryQueued = blocked && retryAttempts < MAX_AUTO_RETRIES;
-		const retryAttempt = retryQueued ? retryAttempts + 1 : retryAttempts;
 
 		pi.appendEntry<ReasoningTokenAudit>(ENTRY_TYPE, {
 			version: 1,
@@ -306,13 +445,18 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 			outputTokens: message.usage.output,
 			totalTokens: message.usage.totalTokens,
 			blocked,
-			retryQueued,
-			retryAttempt,
-			maxRetries: MAX_AUTO_RETRIES,
+			transportRetries: rawRetry?.attempts ?? 0,
+			rejectedReasoningTokens: rawRetry?.rejectedReasoningTokens ?? [],
+			maxTransportRetries: MAX_TRANSPORT_RETRIES,
 			...(!measurement ? {
 				note: 'Real reasoning token field unavailable; output tokens are not used as a proxy.',
 			} : {}),
 		});
+
+		if (message.responseId) {
+			rawCaptureState.byResponseId.delete(message.responseId);
+			rawCaptureState.retryByResponseId.delete(message.responseId);
+		}
 
 		if (!measurement) {
 			notifyUnavailableOnce(ctx, warnedUnavailable);
@@ -322,21 +466,10 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 		const messageWithReasoningTokens = withReasoningTokens(message, measurement);
 		if (!blocked) return { message: messageWithReasoningTokens };
 
-		if (retryQueued) {
-			retryAttempts += 1;
-			pi.setThinkingLevel('xhigh');
-			pi.sendUserMessage([
-				'Reasoning token guard rejected the previous assistant reply.',
-				`Observed reasoning tokens: ${measurement.tokens}. Minimum required: ${MIN_REASONING_TOKENS}.`,
-				`Retry attempt: ${retryAttempts}/${MAX_AUTO_RETRIES}.`,
-				'Answer the original user request again with deeper private reasoning before finalizing.',
-			].join('\n'), { deliverAs: 'followUp' });
-		}
-
 		if (ctx.hasUI) {
 			ctx.ui.notify(
 				`reasoning-token-guard: blocked ${measurement.tokens} reasoning tokens`,
-				retryQueued ? 'warning' : 'error',
+				'error',
 			);
 		}
 
@@ -345,12 +478,7 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 				...messageWithReasoningTokens,
 				content: [{
 					type: 'text',
-					text: buildBlockedText(
-						message,
-						measurement,
-						retryQueued,
-						retryAttempt,
-					),
+					text: buildBlockedText(message, measurement, rawRetry),
 				}],
 				stopReason: 'stop',
 			},
