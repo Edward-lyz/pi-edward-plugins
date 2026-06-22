@@ -18,7 +18,7 @@ const MIN_REASONING_TOKENS = 516;
 const MAX_TRANSPORT_RETRIES = 2;
 const GPT_MODEL_PATTERN = /^gpt/i;
 const GLOBAL_STATE_KEY = '__piBetterUxReasoningTokenGuard';
-const PATCH_VERSION = 7;
+const PATCH_VERSION = 8;
 const FORCE_SSE_ERROR_MESSAGE = 'reasoning-token-guard forces SSE transport for GPT replay';
 const VISIBLE_THINKING_TOKENIZER = 'generic-visible-v1';
 const WHITESPACE_PATTERN = /\s/u;
@@ -57,6 +57,8 @@ type ReasoningTokenAudit = {
 	totalTokens: number;
 	blocked: boolean;
 	transportRetries: number;
+	followUpRetries: number;
+	queuedFollowUpRetry: boolean;
 	rejectedReasoningTokens: number[];
 	maxTransportRetries: number;
 	note?: string;
@@ -841,14 +843,33 @@ function withReasoningTokens(
 	} as AssistantMessage;
 }
 
-function buildBlockedText(message: AssistantMessage, measurement: ReasoningTokenMeasurement, rawRetry: RawRetryInfo | undefined): string {
+function buildBlockedText(
+	message: AssistantMessage,
+	measurement: ReasoningTokenMeasurement,
+	rawRetry: RawRetryInfo | undefined,
+	queuedFollowUpRetryAttempt: number | undefined,
+): string {
 	const tokenLabel = measurement.kind === 'visibleThinkingFallback' ? 'Visible thinking tokens' : 'Reasoning tokens';
-	return [
+	const lines = [
 		'Reasoning token guard blocked this assistant reply.',
 		`Model: ${message.provider}/${message.model}`,
 		`${tokenLabel}: ${measurement.tokens} < ${MIN_REASONING_TOKENS}`,
 		`Source: ${measurement.source}`,
 		`Transport retries: ${rawRetry?.attempts ?? 0}/${MAX_TRANSPORT_RETRIES}`,
+	];
+	if (queuedFollowUpRetryAttempt !== undefined) {
+		lines.push(`Follow-up retry queued: ${queuedFollowUpRetryAttempt}/${MAX_TRANSPORT_RETRIES}`);
+	}
+	return lines.join('\n');
+}
+
+function buildFollowUpRetryPrompt(measurement: ReasoningTokenMeasurement, retryAttempt: number): string {
+	const tokenLabel = measurement.kind === 'visibleThinkingFallback' ? 'visible thinking tokens' : 'reasoning tokens';
+	return [
+		'Reasoning token guard rejected the previous assistant reply.',
+		`Observed ${tokenLabel}: ${measurement.tokens}. Minimum required: ${MIN_REASONING_TOKENS}.`,
+		`Retry attempt: ${retryAttempt}/${MAX_TRANSPORT_RETRIES}.`,
+		'Answer the original user request again with deeper private reasoning before finalizing.',
 	].join('\n');
 }
 
@@ -878,6 +899,7 @@ function notifyUnavailableOnce(ctx: ExtensionContext, warned: { value: boolean }
 export default function reasoningTokenGuard(pi: ExtensionAPI) {
 	const rawCaptureState = installRawReasoningTokenCapture();
 	const warnedUnavailable = { value: false };
+	const followUpRetryState = { attempts: 0, totalAttempts: 0 };
 
 	pi.on('before_provider_request', (_event, ctx) => {
 		rawCaptureState.notify = ctx.hasUI ? ctx.ui.notify.bind(ctx.ui) : undefined;
@@ -894,6 +916,17 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 		const blocked = measurement !== undefined
 			&& isFinalReply(message)
 			&& measurement.tokens < MIN_REASONING_TOKENS;
+		const transportRetries = rawRetry?.attempts ?? 0;
+		// Transport replay can miss an already-loaded runtime; follow-up retry stays visible.
+		if (blocked && transportRetries > followUpRetryState.totalAttempts) {
+			followUpRetryState.totalAttempts = transportRetries;
+		}
+		const queuedFollowUpRetryAttempt = blocked
+			&& followUpRetryState.totalAttempts < MAX_TRANSPORT_RETRIES
+			? followUpRetryState.totalAttempts + 1
+			: undefined;
+		const followUpRetriesAfterMessage = followUpRetryState.attempts
+			+ (queuedFollowUpRetryAttempt === undefined ? 0 : 1);
 
 		pi.appendEntry<ReasoningTokenAudit>(ENTRY_TYPE, {
 			version: 1,
@@ -917,7 +950,9 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 			outputTokens: message.usage.output,
 			totalTokens: message.usage.totalTokens,
 			blocked,
-			transportRetries: rawRetry?.attempts ?? 0,
+			transportRetries,
+			followUpRetries: followUpRetriesAfterMessage,
+			queuedFollowUpRetry: queuedFollowUpRetryAttempt !== undefined,
 			rejectedReasoningTokens: rawRetry?.rejectedReasoningTokens ?? [],
 			maxTransportRetries: MAX_TRANSPORT_RETRIES,
 			...(!measurement ? {
@@ -939,14 +974,26 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 
 		const messageWithReasoningTokens = withReasoningTokens(message, measurement);
 		if (!blocked) {
+			if (isFinalReply(message)) {
+				followUpRetryState.attempts = 0;
+				followUpRetryState.totalAttempts = 0;
+			}
 			notifyReplayAccepted(ctx, rawRetry, measurement);
 			return { message: messageWithReasoningTokens };
+		}
+
+		if (queuedFollowUpRetryAttempt !== undefined) {
+			followUpRetryState.attempts += 1;
+			followUpRetryState.totalAttempts = queuedFollowUpRetryAttempt;
+			pi.sendUserMessage(buildFollowUpRetryPrompt(measurement, queuedFollowUpRetryAttempt), { deliverAs: 'followUp' });
 		}
 
 		if (ctx.hasUI) {
 			const tokenLabel = measurement.kind === 'visibleThinkingFallback' ? 'visible thinking tokens' : 'reasoning tokens';
 			ctx.ui.notify(
-				`reasoning-token-guard: blocked ${measurement.tokens} ${tokenLabel}`,
+				queuedFollowUpRetryAttempt === undefined
+					? `reasoning-token-guard: blocked ${measurement.tokens} ${tokenLabel}`
+					: `reasoning-token-guard: blocked ${measurement.tokens} ${tokenLabel}; queued follow-up retry ${queuedFollowUpRetryAttempt}/${MAX_TRANSPORT_RETRIES}`,
 				'error',
 			);
 		}
@@ -956,7 +1003,7 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 				...messageWithReasoningTokens,
 				content: [{
 					type: 'text',
-					text: buildBlockedText(message, measurement, rawRetry),
+					text: buildBlockedText(message, measurement, rawRetry, queuedFollowUpRetryAttempt),
 				}],
 				stopReason: 'stop',
 			},
