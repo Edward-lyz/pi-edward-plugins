@@ -18,7 +18,7 @@ const MIN_REASONING_TOKENS = 516;
 const MAX_TRANSPORT_RETRIES = 2;
 const GPT_MODEL_PATTERN = /^gpt/i;
 const GLOBAL_STATE_KEY = '__piBetterUxReasoningTokenGuard';
-const PATCH_VERSION = 6;
+const PATCH_VERSION = 7;
 const FORCE_SSE_ERROR_MESSAGE = 'reasoning-token-guard forces SSE transport for GPT replay';
 const VISIBLE_THINKING_TOKENIZER = 'generic-visible-v1';
 const WHITESPACE_PATTERN = /\s/u;
@@ -82,6 +82,7 @@ type RawCaptureState = {
 type RawStreamSummary = {
 	responseId?: string;
 	measurement?: ReasoningTokenMeasurement;
+	visibleThinkingText: string;
 	hasToolCall: boolean;
 	terminal: boolean;
 };
@@ -168,7 +169,7 @@ function extractReasoningMeasurement(value: unknown, sourcePrefix: string): Reas
 }
 
 function createRawStreamSummary(): RawStreamSummary {
-	return { hasToolCall: false, terminal: false };
+	return { visibleThinkingText: '', hasToolCall: false, terminal: false };
 }
 
 function updateRawStreamSummary(summary: RawStreamSummary, event: unknown): void {
@@ -176,6 +177,18 @@ function updateRawStreamSummary(summary: RawStreamSummary, event: unknown): void
 
 	const eventType = typeof event.type === 'string' ? event.type : undefined;
 	const item = isRecord(event.item) ? event.item : undefined;
+	if (eventType === 'response.reasoning_summary_text.delta'
+		|| eventType === 'response.reasoning_text.delta') {
+		const delta = typeof event.delta === 'string' ? event.delta : undefined;
+		if (delta) summary.visibleThinkingText += delta;
+	}
+	if (eventType === 'response.reasoning_summary_part.done') {
+		summary.visibleThinkingText += '\n\n';
+	}
+	if (eventType === 'response.output_item.done' && item?.type === 'reasoning') {
+		const visibleThinkingText = extractOpenAIReasoningItemText(item);
+		if (visibleThinkingText) summary.visibleThinkingText = visibleThinkingText;
+	}
 	if ((eventType === 'response.output_item.added' || eventType === 'response.output_item.done')
 		&& item?.type === 'function_call') {
 		summary.hasToolCall = true;
@@ -192,6 +205,9 @@ function updateRawStreamSummary(summary: RawStreamSummary, event: unknown): void
 	const measurement = (response ? extractReasoningMeasurement(response, 'raw.response') : undefined)
 		?? extractReasoningMeasurement(event, 'raw');
 	if (measurement) summary.measurement = measurement;
+	else if (summary.visibleThinkingText.trim()) {
+		summary.measurement = createVisibleThinkingMeasurement(summary.visibleThinkingText);
+	}
 
 	if (eventType === 'response.completed'
 		|| eventType === 'response.done'
@@ -734,13 +750,25 @@ function countGenericVisibleThinkingTokens(text: string): number {
 	return tokens;
 }
 
-function extractVisibleThinkingMeasurement(message: AssistantMessage): ReasoningTokenMeasurement | undefined {
-	const visibleThinkingText = message.content
-		.filter((content) => content.type === 'thinking' && !content.redacted && content.thinking.trim().length > 0)
-		.map((content) => content.type === 'thinking' ? content.thinking : '')
-		.join('\n');
-	if (!visibleThinkingText) return undefined;
+function extractOpenAIReasoningItemText(item: Record<string, unknown>): string | undefined {
+	const summary = Array.isArray(item.summary)
+		? item.summary
+			.map((part) => isRecord(part) && typeof part.text === 'string' ? part.text : '')
+			.join('\n\n')
+			.trim()
+		: '';
+	if (summary) return summary;
 
+	const content = Array.isArray(item.content)
+		? item.content
+			.map((part) => isRecord(part) && typeof part.text === 'string' ? part.text : '')
+			.join('\n\n')
+			.trim()
+		: '';
+	return content || undefined;
+}
+
+function createVisibleThinkingMeasurement(visibleThinkingText: string): ReasoningTokenMeasurement {
 	return {
 		tokens: countGenericVisibleThinkingTokens(visibleThinkingText),
 		source: `visibleThinking.${VISIBLE_THINKING_TOKENIZER}`,
@@ -748,6 +776,16 @@ function extractVisibleThinkingMeasurement(message: AssistantMessage): Reasoning
 		visibleThinkingChars: visibleThinkingText.length,
 		visibleThinkingTokenizer: VISIBLE_THINKING_TOKENIZER,
 	};
+}
+
+function extractVisibleThinkingMeasurement(message: AssistantMessage): ReasoningTokenMeasurement | undefined {
+	const visibleThinkingText = message.content
+		.filter((content) => content.type === 'thinking' && !content.redacted && content.thinking.trim().length > 0)
+		.map((content) => content.type === 'thinking' ? content.thinking : '')
+		.join('\n');
+	if (!visibleThinkingText) return undefined;
+
+	return createVisibleThinkingMeasurement(visibleThinkingText);
 }
 
 function getRealReasoningTokens(
