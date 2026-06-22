@@ -8,14 +8,24 @@ type TokenRates = {
 	outputEstimated: boolean;
 };
 
+type ThinkingMeasurement = {
+	tokens: number;
+	real: boolean;
+};
+
 type RuntimeState = {
 	roundStartedAt: number | undefined;
 	roundFirstAssistantAt: number | undefined;
 	messageStartedAt: number | undefined;
 	estimatedOutputTokens: number;
+	currentThinking: ThinkingMeasurement | undefined;
+	lastThinking: ThinkingMeasurement | undefined;
 	lastRates: TokenRates;
 	requestRender: (() => void) | undefined;
 };
+
+const WHITESPACE_PATTERN = /\s/u;
+const LETTER_OR_NUMBER_PATTERN = /[\p{Letter}\p{Number}]/u;
 
 function formatCount(value: number): string {
 	if (value < 1000) return `${value}`;
@@ -56,6 +66,102 @@ function formatRate(value: number | undefined): string {
 	return value.toFixed(0);
 }
 
+function readNumber(root: unknown, path: string[]): number | undefined {
+	let current = root;
+	for (const key of path) {
+		if (typeof current !== 'object' || current === null) return undefined;
+		current = (current as Record<string, unknown>)[key];
+	}
+	return typeof current === 'number' && Number.isFinite(current) ? current : undefined;
+}
+
+function isCjkCodePoint(codePoint: number): boolean {
+	return (codePoint >= 0x3400 && codePoint <= 0x4dbf)
+		|| (codePoint >= 0x4e00 && codePoint <= 0x9fff)
+		|| (codePoint >= 0xf900 && codePoint <= 0xfaff)
+		|| (codePoint >= 0x3040 && codePoint <= 0x30ff)
+		|| (codePoint >= 0xac00 && codePoint <= 0xd7af)
+		|| (codePoint >= 0x20000 && codePoint <= 0x2fa1f);
+}
+
+function isAsciiLetterOrNumber(codePoint: number): boolean {
+	return (codePoint >= 0x30 && codePoint <= 0x39)
+		|| (codePoint >= 0x41 && codePoint <= 0x5a)
+		|| (codePoint >= 0x61 && codePoint <= 0x7a);
+}
+
+function countGenericTokens(text: string): number {
+	const encoder = new TextEncoder();
+	let tokens = 0;
+	let wordRun = '';
+	const flushWordRun = () => {
+		if (!wordRun) return;
+		tokens += Math.max(1, Math.ceil(encoder.encode(wordRun).byteLength / 4));
+		wordRun = '';
+	};
+
+	for (const char of text) {
+		if (WHITESPACE_PATTERN.test(char)) {
+			flushWordRun();
+			continue;
+		}
+
+		const codePoint = char.codePointAt(0);
+		if (codePoint === undefined) continue;
+		if (isCjkCodePoint(codePoint)) {
+			flushWordRun();
+			tokens += 1;
+			continue;
+		}
+		if (isAsciiLetterOrNumber(codePoint) || char === '\'') {
+			wordRun += char;
+			continue;
+		}
+		if (LETTER_OR_NUMBER_PATTERN.test(char)) {
+			wordRun += char;
+			continue;
+		}
+		flushWordRun();
+		tokens += 1;
+	}
+	flushWordRun();
+	return tokens;
+}
+
+function extractThinkingMeasurement(message: AssistantMessage): ThinkingMeasurement | undefined {
+	const realTokenPaths = [
+		['usage', 'reasoningTokens'],
+		['usage', 'reasoning_tokens'],
+		['usage', 'reasoningOutputTokens'],
+		['usage', 'reasoning_output_tokens'],
+		['usage', 'thinkingTokens'],
+		['usage', 'thinking_tokens'],
+		['usage', 'outputTokensDetails', 'reasoningTokens'],
+		['usage', 'output_tokens_details', 'reasoning_tokens'],
+		['usage', 'completionTokensDetails', 'reasoningTokens'],
+		['usage', 'completion_tokens_details', 'reasoning_tokens'],
+		['details', 'reasoningTokens'],
+		['details', 'reasoning_tokens'],
+	];
+	for (const path of realTokenPaths) {
+		const tokens = readNumber(message, path);
+		if (tokens !== undefined) return { tokens, real: true };
+	}
+
+	const visibleThinking = message.content
+		.filter((content) => content.type === 'thinking' && !content.redacted && content.thinking.trim().length > 0)
+		.map((content) => content.type === 'thinking' ? content.thinking : '')
+		.join('\n');
+	if (!visibleThinking) return undefined;
+	return { tokens: countGenericTokens(visibleThinking), real: false };
+}
+
+function formatThinking(measurement: ThinkingMeasurement | undefined): string | undefined {
+	if (!measurement) return undefined;
+	const prefix = measurement.real ? '' : '~';
+	return `think ${prefix}${formatCount(measurement.tokens)}`;
+}
+
 function elapsedSeconds(start: number | undefined, end: number): number | undefined {
 	if (start === undefined) return undefined;
 	return Math.max(0.001, (end - start) / 1000);
@@ -81,11 +187,13 @@ function buildStatusLine(ctx: ExtensionContext, state: RuntimeState): string {
 	const ratePrefix = state.lastRates.outputEstimated ? '~' : '';
 	const rateText = `TTFT ${formatRate(ttft)}s · TPS ${ratePrefix}${formatRate(state.lastRates.output)}`;
 	const cacheHitRate = formatCacheHitRate(ctx);
+	const thinking = formatThinking(state.currentThinking ?? state.lastThinking);
 
 	return [
 		theme.fg('accent', ` ${model} `),
 		theme.fg('muted', formatWindow(ctx)),
 		cacheHitRate === undefined ? undefined : theme.fg('muted', cacheHitRate),
+		thinking === undefined ? undefined : theme.fg('warning', thinking),
 		theme.fg('success', rateText),
 	].filter((part): part is string => part !== undefined).join(theme.fg('dim', ' │ '));
 }
@@ -96,6 +204,8 @@ export default function statusline(pi: ExtensionAPI) {
 		roundFirstAssistantAt: undefined,
 		messageStartedAt: undefined,
 		estimatedOutputTokens: 0,
+		currentThinking: undefined,
+		lastThinking: undefined,
 		lastRates: { ttft: undefined, output: undefined, outputEstimated: false },
 		requestRender: undefined,
 	};
@@ -130,6 +240,8 @@ export default function statusline(pi: ExtensionAPI) {
 		state.roundFirstAssistantAt = undefined;
 		state.messageStartedAt = undefined;
 		state.estimatedOutputTokens = 0;
+		state.currentThinking = undefined;
+		state.lastThinking = undefined;
 		state.lastRates = { ttft: undefined, output: undefined, outputEstimated: false };
 		refresh();
 	});
@@ -137,6 +249,7 @@ export default function statusline(pi: ExtensionAPI) {
 	pi.on('before_provider_request', () => {
 		state.messageStartedAt = Date.now();
 		state.estimatedOutputTokens = 0;
+		state.currentThinking = undefined;
 		state.lastRates.output = undefined;
 		state.lastRates.outputEstimated = false;
 		refresh();
@@ -154,6 +267,7 @@ export default function statusline(pi: ExtensionAPI) {
 
 		const outputSeconds = elapsedSeconds(state.messageStartedAt, now);
 		const outputTokens = streamEvent.partial.usage.output;
+		state.currentThinking = extractThinkingMeasurement(streamEvent.partial);
 		if (outputSeconds !== undefined && outputTokens > 0) {
 			state.lastRates.output = outputTokens / outputSeconds;
 			state.lastRates.outputEstimated = false;
@@ -168,6 +282,8 @@ export default function statusline(pi: ExtensionAPI) {
 	pi.on('message_end', (event) => {
 		if (event.message.role !== 'assistant') return;
 		state.lastRates = calculateRates(event.message, state, Date.now());
+		state.lastThinking = extractThinkingMeasurement(event.message);
+		state.currentThinking = undefined;
 		state.messageStartedAt = undefined;
 		refresh();
 	});
