@@ -6,6 +6,7 @@ const MIN_REASONING_TOKENS = 516;
 const MAX_TRANSPORT_RETRIES = 2;
 const GPT_MODEL_PATTERN = /^gpt/i;
 const GLOBAL_STATE_KEY = '__piBetterUxReasoningTokenGuard';
+const PATCH_VERSION = 2;
 
 type ReasoningTokenMeasurement = {
 	tokens: number;
@@ -39,7 +40,8 @@ type ReasoningTokenAudit = {
 };
 
 type RawCaptureState = {
-	installed: boolean;
+	patchVersion?: number;
+	installed?: boolean;
 	fetchPatched: boolean;
 	webSocketPatched: boolean;
 	byResponseId: Map<string, ReasoningTokenMeasurement>;
@@ -78,16 +80,15 @@ function readNumber(root: unknown, path: string[]): number | undefined {
 
 function getRawCaptureState(): RawCaptureState {
 	const globalScope = globalThis as typeof globalThis & {
-		[GLOBAL_STATE_KEY]?: RawCaptureState;
+		[GLOBAL_STATE_KEY]?: Partial<RawCaptureState>;
 	};
-	globalScope[GLOBAL_STATE_KEY] ??= {
-		installed: false,
-		fetchPatched: false,
-		webSocketPatched: false,
-		byResponseId: new Map(),
-		retryByResponseId: new Map(),
-	};
-	return globalScope[GLOBAL_STATE_KEY];
+	const state = globalScope[GLOBAL_STATE_KEY] ?? {};
+	state.fetchPatched ??= false;
+	state.webSocketPatched ??= false;
+	state.byResponseId ??= new Map();
+	state.retryByResponseId ??= new Map();
+	globalScope[GLOBAL_STATE_KEY] = state;
+	return state as RawCaptureState;
 }
 
 function extractReasoningMeasurement(value: unknown, sourcePrefix: string): ReasoningTokenMeasurement | undefined {
@@ -255,7 +256,7 @@ function bufferedResponse(response: Response, body: Uint8Array): Response {
 }
 
 function installFetchCapture(state: RawCaptureState): void {
-	if (state.fetchPatched) return;
+	if (state.fetchPatched && state.patchVersion === PATCH_VERSION) return;
 	const originalFetch = globalThis.fetch;
 	globalThis.fetch = async (input, init) => {
 		if (!parseGuardedFetchBody(input, init)) return originalFetch(input, init);
@@ -280,7 +281,7 @@ function installFetchCapture(state: RawCaptureState): void {
 }
 
 function installWebSocketCapture(state: RawCaptureState): void {
-	if (state.webSocketPatched) return;
+	if (state.webSocketPatched && state.patchVersion === PATCH_VERSION) return;
 	const globalScope = globalThis as unknown as { WebSocket?: WebSocketConstructorLike };
 	const OriginalWebSocket = globalScope.WebSocket;
 	if (!OriginalWebSocket) return;
@@ -335,10 +336,11 @@ function installWebSocketCapture(state: RawCaptureState): void {
 
 function installRawReasoningTokenCapture(): RawCaptureState {
 	const state = getRawCaptureState();
-	if (state.installed) return state;
+	if (state.installed && state.patchVersion === PATCH_VERSION) return state;
 	installFetchCapture(state);
 	installWebSocketCapture(state);
 	state.installed = true;
+	state.patchVersion = PATCH_VERSION;
 	return state;
 }
 
