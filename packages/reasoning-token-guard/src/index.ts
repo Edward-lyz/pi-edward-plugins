@@ -6,7 +6,7 @@ const MIN_REASONING_TOKENS = 516;
 const MAX_TRANSPORT_RETRIES = 2;
 const GPT_MODEL_PATTERN = /^gpt/i;
 const GLOBAL_STATE_KEY = '__piBetterUxReasoningTokenGuard';
-const PATCH_VERSION = 2;
+const PATCH_VERSION = 3;
 
 type ReasoningTokenMeasurement = {
 	tokens: number;
@@ -516,7 +516,7 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 		}
 
 		if (!measurement) {
-			notifyUnavailableOnce(ctx, warnedUnavailable);
+			if (isFinalReply(message)) notifyUnavailableOnce(ctx, warnedUnavailable);
 			return;
 		}
 
