@@ -1,4 +1,15 @@
-import type { AssistantMessage } from '@earendil-works/pi-ai';
+import {
+	createAssistantMessageEventStream,
+	getApiProvider,
+	registerApiProvider,
+	type Api,
+	type AssistantMessage,
+	type AssistantMessageEventStream,
+	type Context,
+	type Model,
+	type SimpleStreamOptions,
+	type StreamOptions,
+} from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 
 const ENTRY_TYPE = 'reasoning-token-guard';
@@ -6,7 +17,7 @@ const MIN_REASONING_TOKENS = 516;
 const MAX_TRANSPORT_RETRIES = 2;
 const GPT_MODEL_PATTERN = /^gpt/i;
 const GLOBAL_STATE_KEY = '__piBetterUxReasoningTokenGuard';
-const PATCH_VERSION = 4;
+const PATCH_VERSION = 5;
 const FORCE_SSE_ERROR_MESSAGE = 'reasoning-token-guard forces SSE transport for GPT replay';
 
 type ReasoningTokenMeasurement = {
@@ -45,10 +56,13 @@ type RawCaptureState = {
 	installed?: boolean;
 	fetchPatched: boolean;
 	webSocketPatched: boolean;
+	apiProviderPatched: boolean;
 	fetchOriginal?: typeof fetch;
 	fetchWrapped?: typeof fetch;
 	webSocketOriginal?: WebSocketConstructorLike;
 	webSocketWrapped?: WebSocketConstructorLike;
+	apiProviderOriginal?: CodexApiProviderLike;
+	apiProviderWrapped?: CodexApiProviderLike;
 	notify?: (message: string, level: 'info' | 'warning' | 'error') => void;
 	byResponseId: Map<string, ReasoningTokenMeasurement>;
 	retryByResponseId: Map<string, RawRetryInfo>;
@@ -79,6 +93,12 @@ type PatchedWebSocketPrototype = {
 	__reasoningTokenGuardAddEventListener?: (type: string, listener: (event: unknown) => void) => void;
 };
 
+type CodexApiProviderLike = {
+	api: Api;
+	stream(model: Model<Api>, context: Context, options?: StreamOptions): AssistantMessageEventStream;
+	streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
+};
+
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null;
 }
@@ -99,6 +119,7 @@ function getRawCaptureState(): RawCaptureState {
 	const state = globalScope[GLOBAL_STATE_KEY] ?? {};
 	state.fetchPatched ??= false;
 	state.webSocketPatched ??= false;
+	state.apiProviderPatched ??= false;
 	state.byResponseId ??= new Map();
 	state.retryByResponseId ??= new Map();
 	globalScope[GLOBAL_STATE_KEY] = state;
@@ -108,7 +129,9 @@ function getRawCaptureState(): RawCaptureState {
 function extractReasoningMeasurement(value: unknown, sourcePrefix: string): ReasoningTokenMeasurement | undefined {
 	const candidates: Array<[string, string[]]> = [
 		['usage.output_tokens_details.reasoning_tokens', ['usage', 'output_tokens_details', 'reasoning_tokens']],
+		['usage.output_tokens_details.reasoning_output_tokens', ['usage', 'output_tokens_details', 'reasoning_output_tokens']],
 		['usage.completion_tokens_details.reasoning_tokens', ['usage', 'completion_tokens_details', 'reasoning_tokens']],
+		['usage.completion_tokens_details.reasoning_output_tokens', ['usage', 'completion_tokens_details', 'reasoning_output_tokens']],
 		['usage.reasoning_output_tokens', ['usage', 'reasoning_output_tokens']],
 		['usage.reasoning_tokens', ['usage', 'reasoning_tokens']],
 		['usage.reasoningTokens', ['usage', 'reasoningTokens']],
@@ -146,10 +169,8 @@ function updateRawStreamSummary(summary: RawStreamSummary, event: unknown): void
 			: undefined;
 	if (responseId) summary.responseId = responseId;
 
-	const measurement = extractReasoningMeasurement(
-		response ?? event,
-		response ? 'raw.response' : 'raw',
-	);
+	const measurement = (response ? extractReasoningMeasurement(response, 'raw.response') : undefined)
+		?? extractReasoningMeasurement(event, 'raw');
 	if (measurement) summary.measurement = measurement;
 
 	if (eventType === 'response.completed'
@@ -398,6 +419,82 @@ function installWebSocketCapture(state: RawCaptureState): void {
 	state.webSocketPatched = true;
 }
 
+function installCodexProviderUsagePatch(state: RawCaptureState): void {
+	const currentProvider = getApiProvider('openai-codex-responses');
+	if (!currentProvider) return;
+	if (currentProvider === state.apiProviderWrapped && state.patchVersion === PATCH_VERSION) return;
+
+	const baseProvider = currentProvider === state.apiProviderWrapped && state.apiProviderOriginal
+		? state.apiProviderOriginal
+		: currentProvider;
+	const wrappedProvider: CodexApiProviderLike = {
+		api: 'openai-codex-responses',
+		stream: (model, context, options) => wrapCodexProviderStream(baseProvider.stream(model, context, options), state),
+		streamSimple: (model, context, options) => wrapCodexProviderStream(baseProvider.streamSimple(model, context, options), state),
+	};
+
+	registerApiProvider(wrappedProvider, ENTRY_TYPE);
+	state.apiProviderOriginal = baseProvider;
+	state.apiProviderWrapped = wrappedProvider;
+	state.apiProviderPatched = true;
+}
+
+function wrapCodexProviderStream(
+	innerStream: AssistantMessageEventStream,
+	state: RawCaptureState,
+): AssistantMessageEventStream {
+	const outerStream = createAssistantMessageEventStream();
+	void (async () => {
+		try {
+			for await (const event of innerStream) {
+				if (event.type === 'done' && event.message.role === 'assistant') {
+					const message = withCapturedReasoningTokens(event.message, state);
+					outerStream.push({ ...event, message });
+					continue;
+				}
+				if (event.type === 'error' && event.error.role === 'assistant') {
+					const error = withCapturedReasoningTokens(event.error, state);
+					outerStream.push({ ...event, error });
+					continue;
+				}
+				outerStream.push(event);
+			}
+			outerStream.end();
+		} catch (error) {
+			outerStream.push({
+				type: 'error',
+				reason: 'error',
+				error: error instanceof Error
+					? createProviderPatchErrorMessage(error)
+					: createProviderPatchErrorMessage(new Error(String(error))),
+			});
+			outerStream.end();
+		}
+	})();
+	return outerStream;
+}
+
+function createProviderPatchErrorMessage(error: Error): AssistantMessage {
+	return {
+		role: 'assistant',
+		content: [],
+		api: 'openai-codex-responses',
+		provider: 'openai-codex',
+		model: 'unknown',
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: 'error',
+		errorMessage: error.message,
+		timestamp: Date.now(),
+	};
+}
+
 function patchWebSocketPrototypeChain(WebSocketCtor: WebSocketConstructorLike, state: RawCaptureState): void {
 	let current: unknown = WebSocketCtor;
 	while (typeof current === 'function' && current !== Function.prototype) {
@@ -464,6 +561,7 @@ function installRawReasoningTokenCapture(): RawCaptureState {
 	const state = getRawCaptureState();
 	installFetchCapture(state);
 	installWebSocketCapture(state);
+	installCodexProviderUsagePatch(state);
 	state.installed = true;
 	state.patchVersion = PATCH_VERSION;
 	return state;
@@ -497,6 +595,14 @@ function getReasoningTokens(
 ): ReasoningTokenMeasurement | undefined {
 	return extractMessageReasoningTokens(message)
 		?? (message.responseId ? rawCaptureState.byResponseId.get(message.responseId) : undefined);
+}
+
+function withCapturedReasoningTokens(
+	message: AssistantMessage,
+	rawCaptureState: RawCaptureState,
+): AssistantMessage {
+	const measurement = getReasoningTokens(message, rawCaptureState);
+	return measurement ? withReasoningTokens(message, measurement) : message;
 }
 
 function isTrackedModel(message: AssistantMessage): boolean {
