@@ -594,8 +594,10 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 		}
 
 		const messageWithReasoningTokens = withReasoningTokens(message, measurement);
-		notifyReplayAccepted(ctx, rawRetry, measurement);
-		if (!blocked) return { message: messageWithReasoningTokens };
+		if (!blocked) {
+			notifyReplayAccepted(ctx, rawRetry, measurement);
+			return { message: messageWithReasoningTokens };
+		}
 
 		if (ctx.hasUI) {
 			ctx.ui.notify(
