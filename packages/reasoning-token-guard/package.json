@@ -7,7 +7,7 @@
   "keywords": ["pi-package"],
   "license": "MIT",
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": ["./src/reasoning-token-guard.ts"]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

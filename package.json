@@ -41,13 +41,13 @@
   },
   "pi": {
     "extensions": [
-      "packages/code-block-fix/src/index.ts",
-      "packages/co-dev/src/index.ts",
-      "packages/rtk/src/index.ts",
-      "packages/reasoning-token-guard/src/index.ts",
-      "packages/statusline/src/index.ts",
-      "packages/system-context/src/index.ts",
-      "packages/usage-report/src/index.ts"
+      "packages/code-block-fix/src/code-block-fix.ts",
+      "packages/co-dev/src/co-dev.ts",
+      "packages/rtk/src/rtk.ts",
+      "packages/reasoning-token-guard/src/reasoning-token-guard.ts",
+      "packages/statusline/src/statusline.ts",
+      "packages/system-context/src/system-context.ts",
+      "packages/usage-report/src/usage-report.ts"
     ]
   }
 }

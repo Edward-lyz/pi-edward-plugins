@@ -19,13 +19,13 @@ pi -e .
 
 | Extension | Path | What it does | Notes |
 |---|---|---|---|
-| `code-block-fix` | `packages/code-block-fix/src/index.ts` | Renders markdown code blocks with Unicode box borders. | Monkey-patches Pi markdown rendering. |
-| `co-dev` | `packages/co-dev/src/index.ts` | Runs a second-model review loop after each agent answer. | Configure with `/co-dev`; requires a usable Pi model and API key. |
-| `reasoning-token-guard` | `packages/reasoning-token-guard/src/index.ts` | Persists GPT reasoning token metadata and retries final replies below 516 reasoning tokens. | Only enforces when the provider exposes a real reasoning token field; it never treats total output tokens as reasoning tokens. |
-| `rtk` | `packages/rtk/src/index.ts` | Rewrites `bash` / `exec_command` commands through `rtk rewrite` before execution. | Requires `rtk` in `PATH`. |
-| `statusline` | `packages/statusline/src/index.ts` | Replaces the footer with model, context, cache-hit rate, TTFT, and output-rate info. | UI sessions only. |
-| `system-context` | `packages/system-context/src/index.ts` | Injects OS, shell, cwd, Node version, and a shallow directory tree into the system prompt. | Directory tree depth is intentionally small. |
-| `usage-report` | `packages/usage-report/src/index.ts` | Serves a local usage dashboard with token activity, tool/skill counts, and API-cost estimates. | Use `/usage-report open\|start [port]\|status\|stop`; model prices come from Pi model config plus LiteLLM's public price table. |
+| `code-block-fix` | `packages/code-block-fix/src/code-block-fix.ts` | Renders markdown code blocks with Unicode box borders. | Monkey-patches Pi markdown rendering. |
+| `co-dev` | `packages/co-dev/src/co-dev.ts` | Runs a second-model review loop after each agent answer. | Configure with `/co-dev`; requires a usable Pi model and API key. |
+| `reasoning-token-guard` | `packages/reasoning-token-guard/src/reasoning-token-guard.ts` | Persists GPT reasoning token metadata and retries final replies below 516 reasoning tokens. | Only enforces when the provider exposes a real reasoning token field; it never treats total output tokens as reasoning tokens. |
+| `rtk` | `packages/rtk/src/rtk.ts` | Rewrites `bash` / `exec_command` commands through `rtk rewrite` before execution. | Requires `rtk` in `PATH`. |
+| `statusline` | `packages/statusline/src/statusline.ts` | Replaces the footer with model, context, cache-hit rate, TTFT, and output-rate info. | UI sessions only. |
+| `system-context` | `packages/system-context/src/system-context.ts` | Injects OS, shell, cwd, Node version, and a shallow directory tree into the system prompt. | Directory tree depth is intentionally small. |
+| `usage-report` | `packages/usage-report/src/usage-report.ts` | Serves a local usage dashboard with token activity, tool/skill counts, and API-cost estimates. | Use `/usage-report open\|start [port]\|status\|stop`; model prices come from Pi model config plus LiteLLM's public price table. |
 
 ## Load one extension
 
@@ -34,7 +34,7 @@ pi -e .
   "packages": [
     {
       "source": "npm:pi-better-ux",
-      "extensions": ["packages/code-block-fix/src/index.ts"]
+      "extensions": ["packages/code-block-fix/src/code-block-fix.ts"]
     }
   ]
 }
