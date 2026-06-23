@@ -10,7 +10,7 @@ import {
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 const DEFAULT_PORT = 30143;
-const SERVER_VERSION = 1;
+const SERVER_VERSION = 2;
 const LITELLM_PRICE_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';
 const PRICE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
@@ -745,179 +745,791 @@ function getServer(): UsageReportServer {
 
 function reportHtml(): string {
   return `<!doctype html>
-<html lang="zh-CN">
+<html lang='zh-CN'>
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Pi Usage Report</title>
+  <meta charset='utf-8'>
+  <meta name='viewport' content='width=device-width, initial-scale=1'>
+  <title>Pi Usage Dashboard</title>
   <style>
-    :root { color-scheme: light; --text: #343434; --muted: #8a8a8a; --line: #eeeeee; --soft: #f6f6f6; --blue1: #d6e7fb; --blue2: #a9cdf6; --blue3: #75acec; --blue4: #2f7fd5; }
+    :root {
+      color-scheme: dark;
+      --bg: #070814;
+      --panel: rgba(255, 255, 255, 0.052);
+      --panel-hover: rgba(255, 255, 255, 0.08);
+      --line: rgba(255, 255, 255, 0.09);
+      --line-soft: rgba(255, 255, 255, 0.06);
+      --text: rgba(255, 255, 255, 0.88);
+      --muted: rgba(255, 255, 255, 0.35);
+      --dim: rgba(255, 255, 255, 0.22);
+      --blue: #60a5fa;
+      --green: #4ade80;
+      --amber: #fbbf24;
+      --rose: #fb7185;
+      --violet: #a78bfa;
+      --indigo: #818cf8;
+      --radius: 12px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+
     * { box-sizing: border-box; }
-    body { margin: 0; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: var(--text); background: #ffffff; }
-    main { max-width: 1120px; margin: 0 auto; padding: 46px 36px 70px; }
-    .profile { text-align: center; margin-bottom: 44px; }
-    .avatar { width: 116px; height: 116px; border-radius: 999px; display: inline-grid; place-items: center; color: #fff; background: #f5c400; font-size: 42px; letter-spacing: 1px; }
-    h1 { margin: 22px 0 6px; font-weight: 500; font-size: 30px; }
-    .subtitle, .muted { color: var(--muted); }
-    .stat-card { border: 1px solid var(--line); border-radius: 22px; display: grid; grid-template-columns: repeat(5, 1fr); overflow: hidden; margin-bottom: 54px; }
-    .stat { min-height: 76px; display: grid; place-items: center; border-left: 1px solid var(--line); }
-    .stat:first-child { border-left: 0; }
-    .stat strong { display: block; font-size: 22px; font-weight: 500; }
-    .stat span { display: block; color: var(--muted); margin-top: 3px; }
-    .section-head { display: flex; justify-content: space-between; align-items: baseline; gap: 20px; margin-bottom: 18px; }
-    h2 { font-size: 21px; margin: 0; font-weight: 650; }
-    .heatmap { display: grid; grid-template-columns: repeat(53, 14px); grid-auto-flow: column; grid-template-rows: repeat(7, 14px); gap: 5px; min-height: 128px; }
-    .cell { width: 14px; height: 14px; border-radius: 4px; background: #f5f5f5; }
-    .l1 { background: var(--blue1); } .l2 { background: var(--blue2); } .l3 { background: var(--blue3); } .l4 { background: var(--blue4); }
-    .month-row { display: grid; grid-template-columns: repeat(12, 1fr); margin-top: 12px; color: var(--muted); }
-    .split { display: grid; grid-template-columns: 1fr 1fr; gap: 64px; margin-top: 52px; }
-    .rows { display: grid; gap: 12px; }
-    .row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 18px; align-items: baseline; }
-    .row .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .row .value { color: var(--muted); white-space: nowrap; }
-    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-    th, td { text-align: left; padding: 9px 0; border-bottom: 1px solid var(--line); font-size: 14px; }
-    th { color: var(--muted); font-weight: 500; }
-    .notice { margin-top: 22px; padding: 14px 16px; border-radius: 14px; background: var(--soft); color: #666; white-space: pre-wrap; }
-    @media (max-width: 820px) { main { padding: 30px 18px 56px; } .stat-card { grid-template-columns: 1fr 1fr; } .split { grid-template-columns: 1fr; gap: 34px; } .heatmap { overflow-x: auto; } }
+    html { min-height: 100%; background: var(--bg); }
+    body {
+      margin: 0;
+      min-height: 100%;
+      color: var(--text);
+      font-family: var(--sans);
+      background:
+        radial-gradient(circle at 20% -10%, rgba(37, 99, 235, 0.25), transparent 34rem),
+        radial-gradient(circle at 80% 5%, rgba(124, 58, 237, 0.18), transparent 30rem),
+        linear-gradient(180deg, #070814 0%, #090b16 48%, #060712 100%);
+      -webkit-font-smoothing: antialiased;
+    }
+
+    button { font: inherit; }
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+      background: rgba(6, 6, 16, 0.72);
+      backdrop-filter: blur(24px);
+    }
+    .topbar-inner {
+      max-width: 1280px;
+      height: 44px;
+      margin: 0 auto;
+      padding: 0 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .brand { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .logo {
+      width: 24px;
+      height: 24px;
+      border-radius: 7px;
+      display: grid;
+      place-items: center;
+      flex: 0 0 auto;
+      color: #bfdbfe;
+      font-family: Georgia, serif;
+      font-size: 15px;
+      font-weight: 700;
+      background: rgba(59, 130, 246, 0.18);
+      border: 1px solid rgba(96, 165, 250, 0.30);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.15);
+    }
+    .brand-title {
+      font-size: 13px;
+      font-weight: 650;
+      letter-spacing: -0.01em;
+      color: rgba(255, 255, 255, 0.86);
+      white-space: nowrap;
+    }
+
+    .range-control {
+      display: flex;
+      gap: 2px;
+      padding: 2px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.05);
+    }
+    .range-button {
+      border: 0;
+      border-radius: 6px;
+      padding: 5px 12px;
+      color: rgba(255, 255, 255, 0.42);
+      background: transparent;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1;
+      cursor: pointer;
+      transition: 150ms ease;
+    }
+    .range-button:hover { color: rgba(255, 255, 255, 0.72); background: rgba(255, 255, 255, 0.07); }
+    .range-button.active { color: #fff; background: rgba(255, 255, 255, 0.15); }
+
+    .top-actions { display: flex; align-items: center; gap: 8px; }
+    .pricing-chip {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.05);
+      font-size: 11px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .chip-dot { width: 6px; height: 6px; border-radius: 999px; animation: pulse 1.6s ease-in-out infinite; }
+    .pricing-ok { color: rgba(74, 222, 128, 0.85); }
+    .pricing-ok .chip-dot { background: var(--green); }
+    .pricing-bad { color: rgba(251, 113, 133, 0.85); }
+    .pricing-bad .chip-dot { background: var(--rose); }
+    @keyframes pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+
+    .icon-button {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      color: rgba(255, 255, 255, 0.42);
+      background: rgba(255, 255, 255, 0.05);
+      display: grid;
+      place-items: center;
+      cursor: pointer;
+      transition: 150ms ease;
+    }
+    .icon-button:hover { color: rgba(255, 255, 255, 0.82); background: rgba(255, 255, 255, 0.10); }
+    .icon-button.loading { animation: spin 900ms linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    main {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 16px 16px 20px;
+      display: grid;
+      gap: 12px;
+    }
+    .grid { display: grid; gap: 12px; }
+    .kpi-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
+    .main-grid { grid-template-columns: minmax(0, 3fr) minmax(320px, 2fr); }
+    .lower-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+
+    .panel {
+      position: relative;
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: var(--panel);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.11), 0 1px 4px rgba(0,0,0,0.5);
+      backdrop-filter: blur(22px);
+    }
+    .panel-pad { padding: 16px; }
+    .kpi {
+      min-height: 108px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      cursor: default;
+      transition: 150ms ease;
+    }
+    .kpi:hover { background: var(--panel-hover); }
+    .kpi-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .kpi-label, .section-kicker, .tile-label {
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: 0.10em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .kpi-icon { opacity: 0.72; font-size: 13px; }
+    .kpi-value {
+      font-family: var(--mono);
+      font-size: 22px;
+      line-height: 1;
+      font-weight: 750;
+      color: #fff;
+      letter-spacing: -0.03em;
+    }
+    .kpi-sub { color: rgba(255, 255, 255, 0.30); font-size: 11px; line-height: 1.15; }
+    .blue { color: var(--blue); } .green { color: var(--green); } .amber { color: var(--amber); }
+    .rose { color: var(--rose); } .violet { color: var(--violet); } .indigo { color: var(--indigo); }
+
+    .section-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .section-title { display: flex; align-items: center; gap: 7px; min-width: 0; }
+    .section-icon { color: rgba(255, 255, 255, 0.30); font-size: 12px; }
+    .section-right { color: var(--dim); font-family: var(--mono); font-size: 10px; white-space: nowrap; }
+
+    .heatmap-wrap { position: relative; user-select: none; }
+    .heatmap-scroller { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 4px; scrollbar-width: none; }
+    .heatmap-scroller::-webkit-scrollbar { display: none; }
+    .dow-labels { display: flex; flex-direction: column; gap: 2px; flex: 0 0 auto; }
+    .dow-labels div { width: 10px; height: 11px; display: flex; align-items: center; color: var(--dim); font-size: 8px; line-height: 1; }
+    .weeks { display: flex; gap: 2px; flex: 0 0 auto; }
+    .week { display: flex; flex-direction: column; gap: 2px; }
+    .heat-cell {
+      width: 11px;
+      height: 11px;
+      border-radius: 2px;
+      background: rgba(255,255,255,0.04);
+      transition: 100ms ease;
+    }
+    .heat-cell:hover { outline: 1px solid rgba(255,255,255,0.30); transform: scale(1.12); }
+    .h1 { background: rgba(30, 58, 138, 0.60); }
+    .h2 { background: rgba(29, 78, 216, 0.66); }
+    .h3 { background: rgba(59, 130, 246, 0.76); }
+    .h4 { background: rgba(96, 165, 250, 0.92); }
+    .heat-legend { display: flex; align-items: center; gap: 4px; margin-top: 8px; color: var(--dim); font-size: 9px; }
+    .legend-cell { width: 9px; height: 9px; border-radius: 2px; }
+
+    .tooltip {
+      position: fixed;
+      z-index: 50;
+      pointer-events: none;
+      min-width: 160px;
+      padding: 9px 11px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(8, 8, 20, 0.94);
+      box-shadow: 0 12px 40px rgba(0,0,0,0.45), inset 0 1px 0 rgba(255,255,255,0.10);
+      backdrop-filter: blur(18px);
+      display: none;
+    }
+    .tooltip-title { font-size: 12px; font-weight: 700; margin-bottom: 4px; color: #fff; }
+    .tooltip-main { font-family: var(--mono); font-size: 11px; color: rgba(255,255,255,0.62); }
+    .tooltip-sub { font-size: 10px; color: var(--muted); margin-top: 3px; }
+
+    .trend { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line-soft); }
+    .trend-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+    .trend-label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); font-weight: 750; }
+    .trend-range { font-family: var(--mono); font-size: 10px; color: rgba(96,165,250,0.75); }
+    .spark svg { width: 100%; height: 72px; display: block; }
+
+    table { width: 100%; border-collapse: collapse; }
+    th {
+      padding: 8px 8px;
+      border-bottom: 1px solid var(--line-soft);
+      color: rgba(255, 255, 255, 0.30);
+      font-size: 10px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-align: right;
+    }
+    th:first-child { text-align: left; padding-left: 0; }
+    th:last-child { padding-right: 0; }
+    td {
+      padding: 10px 8px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      text-align: right;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: rgba(255, 255, 255, 0.62);
+      vertical-align: middle;
+    }
+    td:first-child { text-align: left; padding-left: 0; }
+    td:last-child { padding-right: 0; }
+    tr:hover td { background: rgba(255,255,255,0.035); }
+    .sort { border: 0; background: transparent; color: inherit; padding: 0; cursor: pointer; font-size: inherit; font-weight: inherit; }
+    .model-provider { font-family: var(--sans); font-size: 9px; font-weight: 900; text-transform: uppercase; letter-spacing: 0.06em; }
+    .model-name { margin-top: 3px; color: rgba(255,255,255,0.78); font-size: 11px; line-height: 1.25; overflow-wrap: anywhere; }
+    .price-ok { color: rgba(255,255,255,0.62); }
+    .price-unknown { color: rgba(251,191,36,0.86); }
+    .check { color: rgba(74,222,128,0.68); }
+    .no-check { color: rgba(255,255,255,0.16); }
+    .breakdown { margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--line-soft); display: grid; grid-template-columns: 1fr 1fr; gap: 7px 12px; }
+    .breakdown-row { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 10px; }
+    .breakdown-row strong { font-family: var(--mono); font-size: 10px; font-weight: 650; }
+
+    .bar-list { display: grid; gap: 0; }
+    .bar-row { display: flex; align-items: center; gap: 10px; margin: 0 -4px; padding: 6px 4px; border-radius: 7px; transition: 100ms ease; }
+    .bar-row:hover { background: rgba(255,255,255,0.04); }
+    .bar-name { width: 112px; flex: 0 0 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: rgba(255,255,255,0.62); font-family: var(--mono); font-size: 11px; }
+    .bar-track { flex: 1 1 auto; height: 5px; border-radius: 999px; overflow: hidden; background: rgba(255,255,255,0.07); }
+    .bar-fill { height: 100%; border-radius: inherit; transition: width 500ms ease; }
+    .blue-bg { background: rgba(59, 130, 246, 0.68); }
+    .violet-bg { background: rgba(139, 92, 246, 0.68); }
+    .bar-count { width: 48px; flex: 0 0 auto; text-align: right; color: var(--muted); font-family: var(--mono); font-size: 10px; }
+
+    .insight-stack { display: grid; gap: 8px; }
+    .insight-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .tile { padding: 14px; display: grid; gap: 7px; }
+    .tile-value { font-family: var(--mono); font-size: 18px; line-height: 1; font-weight: 800; }
+    .tile-sub { color: var(--muted); font-size: 10px; line-height: 1.25; }
+    .micro-panel { padding: 16px; display: grid; gap: 10px; }
+    .micro-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .micro-row span:first-child { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 800; }
+    .micro-row span:last-child { font-family: var(--mono); font-size: 11px; }
+
+    .warning-link {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(251,191,36,0.20);
+      background: rgba(251,191,36,0.06);
+      color: rgba(251,191,36,0.84);
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .errors { overflow: hidden; }
+    .errors button {
+      width: 100%;
+      border: 0;
+      background: transparent;
+      color: inherit;
+      padding: 13px 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      cursor: pointer;
+    }
+    .errors button:hover { background: rgba(255,255,255,0.04); }
+    .error-body { display: none; padding: 12px 16px 16px; border-top: 1px solid var(--line-soft); }
+    .errors.expanded .error-body { display: grid; gap: 8px; }
+    .error-line { padding: 11px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.07); background: rgba(255,255,255,0.04); color: rgba(255,255,255,0.56); font-family: var(--mono); font-size: 11px; line-height: 1.55; }
+    .error-line b { color: rgba(251,191,36,0.68); margin-right: 8px; user-select: none; }
+
+    .notice { padding: 14px 16px; border-radius: 12px; border: 1px solid rgba(251,191,36,0.18); background: rgba(251,191,36,0.06); color: rgba(251,191,36,0.84); font-size: 12px; line-height: 1.55; white-space: pre-wrap; }
+    .footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 4px 0 0; color: rgba(255,255,255,0.20); font-size: 10px; }
+    .footer code { font-family: var(--mono); }
+    .hide-sm { display: table-cell; }
+
+    @media (max-width: 980px) {
+      .kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .main-grid, .lower-grid { grid-template-columns: 1fr; }
+      .pricing-chip { display: none; }
+    }
+    @media (max-width: 640px) {
+      .topbar-inner { padding: 0 10px; }
+      .brand-title { display: none; }
+      .range-button { padding: 5px 9px; }
+      main { padding: 12px 10px 18px; }
+      .kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .hide-sm { display: none; }
+      th.hide-sm, td.hide-sm { display: none; }
+      .footer { flex-direction: column; align-items: flex-start; }
+      .bar-name { width: 96px; }
+    }
   </style>
 </head>
 <body>
-<main>
-  <section class="profile">
-    <div class="avatar">PI</div>
-    <h1>Pi Usage Report</h1>
-    <div id="subtitle" class="subtitle">loading...</div>
-  </section>
-  <section id="summary" class="stat-card"></section>
-  <section>
-    <div class="section-head"><h2>Token 活动</h2><div class="muted">最近 365 天</div></div>
-    <div id="heatmap" class="heatmap"></div>
-    <div id="monthRow" class="month-row"></div>
-  </section>
-  <section class="split">
-    <div><h2>活动洞察</h2><div id="insights" class="rows"></div></div>
-    <div><h2>最常用的工具/技能</h2><div id="topTools" class="rows"></div></div>
-  </section>
-  <section style="margin-top: 52px;"><h2>模型与 API 计费</h2><div id="models"></div></section>
-  <div id="notices"></div>
-</main>
+  <header class='topbar'>
+    <div class='topbar-inner'>
+      <div class='brand'>
+        <div class='logo'>π</div>
+        <div class='brand-title'>Pi Usage</div>
+      </div>
+      <div class='range-control' id='rangeControl' aria-label='Date range'>
+        <button class='range-button' data-range='7d'>7d</button>
+        <button class='range-button active' data-range='30d'>30d</button>
+        <button class='range-button' data-range='90d'>90d</button>
+        <button class='range-button' data-range='365d'>365d</button>
+      </div>
+      <div class='top-actions'>
+        <div id='pricingChip' class='pricing-chip pricing-bad'><span class='chip-dot'></span><span>Loading</span></div>
+        <button id='refreshButton' class='icon-button' aria-label='Refresh'>↻</button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div id='kpis' class='grid kpi-grid'></div>
+
+    <div class='grid main-grid'>
+      <section class='panel panel-pad'>
+        <div class='section-head'>
+          <div class='section-title'><span class='section-icon'>▦</span><span class='section-kicker'>Activity</span></div>
+          <div id='activitySummary' class='section-right'>-</div>
+        </div>
+        <div id='heatmap' class='heatmap-wrap'></div>
+        <div class='trend'>
+          <div class='trend-head'><span class='trend-label'>Token Volume</span><span id='trendRange' class='trend-range'>30d trend</span></div>
+          <div id='sparkline' class='spark'></div>
+        </div>
+      </section>
+
+      <section class='panel panel-pad'>
+        <div class='section-head'>
+          <div class='section-title'><span class='section-icon'>◌</span><span class='section-kicker'>Top Models</span></div>
+          <div id='unknownModels' class='section-right amber'></div>
+        </div>
+        <div id='models'></div>
+        <div id='tokenBreakdown' class='breakdown'></div>
+      </section>
+    </div>
+
+    <div class='grid lower-grid'>
+      <section class='panel panel-pad'>
+        <div class='section-head'><div class='section-title'><span class='section-icon'>⌁</span><span class='section-kicker'>Top Tools</span></div></div>
+        <div id='topTools' class='bar-list'></div>
+      </section>
+
+      <section class='panel panel-pad'>
+        <div class='section-head'><div class='section-title'><span class='section-icon'>◇</span><span class='section-kicker'>Top Skills</span></div></div>
+        <div id='topSkills' class='bar-list'></div>
+      </section>
+
+      <section class='insight-stack'>
+        <div class='panel panel-pad'>
+          <div class='section-head'><div class='section-title'><span class='section-icon'>✦</span><span class='section-kicker'>Insights</span></div></div>
+          <div id='insights' class='insight-grid'></div>
+        </div>
+        <div id='microStats' class='panel micro-panel'></div>
+        <button id='errorJump' class='warning-link' style='display: none;'>⚠ <span></span><span style='margin-left:auto'>⌄</span></button>
+      </section>
+    </div>
+
+    <section id='scanErrors' class='panel errors' style='display: none;'></section>
+    <div id='notices' class='grid'></div>
+    <footer class='footer'><span id='generatedAt'>Generated -</span><code id='agentDir'>-</code></footer>
+  </main>
+
+  <div id='tooltip' class='tooltip'></div>
+
 <script>
-const nf = new Intl.NumberFormat('zh-CN');
-const money = (value, unknown) => '$' + value.toFixed(value < 1 ? 4 : 2) + (unknown ? ' + unknown' : '');
-const compact = (value) => {
-  if (value < 10000) return nf.format(Math.round(value));
-  if (value < 100000000) return (value / 10000).toFixed(value < 100000 ? 1 : 0) + '万';
-  return (value / 100000000).toFixed(1) + '亿';
-};
-const duration = (seconds) => {
+const RANGE_DAYS = { '7d': 7, '30d': 30, '90d': 90, '365d': 365 };
+const state = { report: null, range: '30d', sortField: 'tokens', sortDir: 'desc', errorsExpanded: false };
+const nf = new Intl.NumberFormat('en-US');
+
+const $ = (id) => document.getElementById(id);
+const sum = (items, getter) => items.reduce((total, item) => total + getter(item), 0);
+
+function finiteNumber(value, label) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) throw new Error('Invalid numeric value for ' + label + ': ' + value);
+  return number;
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+
+function fmtTokens(value) {
+  const n = finiteNumber(value, 'tokens');
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(Math.round(n));
+}
+
+function fmtCount(value) {
+  const n = finiteNumber(value, 'count');
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'k';
+  return nf.format(n);
+}
+
+function fmtCost(value, unknown) {
+  const n = finiteNumber(value, 'cost');
+  const digits = n > 0 && n < 1 ? 4 : 2;
+  return '$' + n.toLocaleString('en-US', { minimumFractionDigits: digits, maximumFractionDigits: digits }) + (unknown ? ' + unknown' : '');
+}
+
+function fmtDateShort(dateText) {
+  return new Date(dateText + 'T00:00:00').toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function duration(seconds) {
   if (!seconds) return '-';
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = Math.round(seconds % 60);
-  if (h > 0) return h + '小时 ' + m + '分';
-  if (m > 0) return m + '分 ' + s + '秒';
-  return s + '秒';
-};
-const row = (name, value) => '<div class="row"><div class="name">' + name + '</div><div class="value">' + value + '</div></div>';
-const escapeHtml = (text) => String(text).replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
-
-function dateKey(date) {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
-  return y + '-' + m + '-' + d;
+  const totalSeconds = finiteNumber(seconds, 'duration');
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const secs = Math.round(totalSeconds % 60);
+  if (hours > 0) return hours + 'h ' + minutes + 'm';
+  if (minutes > 0) return minutes + 'm ' + secs + 's';
+  return secs + 's';
 }
 
-function renderSummary(report) {
+function priceSourceCount(model) {
+  return Object.keys(model.priceSources || {}).length;
+}
+
+function currentView(report) {
+  const days = RANGE_DAYS[state.range] || 30;
+  const daily = report.daily.slice(-days);
+  return {
+    days,
+    daily,
+    tokens: sum(daily, (day) => finiteNumber(day.tokens, 'daily tokens')),
+    cost: sum(daily, (day) => finiteNumber(day.cost, 'daily cost')),
+    messages: sum(daily, (day) => finiteNumber(day.assistantMessages, 'daily assistant messages')),
+  };
+}
+
+function renderPricing(report) {
+  const ok = report.pricing.status === 'ok';
+  $('pricingChip').className = 'pricing-chip ' + (ok ? 'pricing-ok' : 'pricing-bad');
+  $('pricingChip').innerHTML = '<span class="chip-dot"></span><span>' + (ok ? 'Prices live' : 'No prices') + '</span>';
+}
+
+function renderKpis(report, view) {
   const t = report.totals;
-  document.getElementById('summary').innerHTML = [
-    ['累计 Token 数', compact(t.tokens.total)],
-    ['峰值 Token 数', compact(t.peakDayTokens)],
-    ['最长任务时长≈', duration(t.longestTask && t.longestTask.seconds)],
-    ['当前连续天数', t.currentStreakDays + ' 天'],
-    ['API 计费', money(t.repricedCost, t.unknownCostMessages || t.partialUnknownCostMessages)],
-  ].map(([label, value]) => '<div class="stat"><div><strong>' + value + '</strong><span>' + label + '</span></div></div>').join('');
+  const longestTask = t.longestTask;
+  const taskSub = longestTask ? 'session ' + longestTask.sessionId.slice(0, 8) : 'no completed task';
+  const cards = [
+    ['Total Tokens', fmtTokens(view.tokens), fmtTokens(t.tokens.total) + ' all-time', 'blue', 'ϟ'],
+    ['Est. Cost', fmtCost(view.cost), fmtCost(t.repricedCost) + ' all-time', 'green', '$'],
+    ['Asst. Messages', nf.format(view.messages), nf.format(t.userMessages) + ' user', 'indigo', '✉'],
+    ['Tool Calls', nf.format(t.toolCalls), nf.format(t.scannedSessions) + ' sessions', 'violet', '⌁'],
+    ['Streak', t.currentStreakDays + 'd', 'Best: ' + t.longestStreakDays + 'd', 'amber', '●'],
+    ['Longest Task', duration(longestTask && longestTask.seconds), taskSub, 'rose', '◷'],
+  ];
+  $('kpis').innerHTML = cards.map(([label, value, sub, color, icon]) =>
+    '<div class="panel kpi"><div class="kpi-top"><span class="kpi-label">' + label + '</span><span class="kpi-icon ' + color + '">' + icon + '</span></div><div class="kpi-value">' + value + '</div><div class="kpi-sub">' + escapeHtml(sub) + '</div></div>'
+  ).join('');
 }
 
-function renderHeatmap(report) {
-  const byDate = new Map(report.daily.map((day) => [day.date, day]));
-  const max = Math.max(1, ...report.daily.map((day) => day.tokens));
-  const today = new Date();
-  const start = new Date(today);
-  start.setDate(start.getDate() - 364);
-  const cells = [];
-  for (let i = 0; i < start.getDay(); i++) cells.push('<div></div>');
-  for (let i = 0; i < 365; i++) {
-    const date = new Date(start);
-    date.setDate(start.getDate() + i);
-    const key = dateKey(date);
-    const day = byDate.get(key);
-    const tokens = day ? day.tokens : 0;
-    const level = tokens === 0 ? 0 : Math.max(1, Math.ceil(Math.log1p(tokens) / Math.log1p(max) * 4));
-    cells.push('<div class="cell l' + level + '" title="' + key + ' · ' + compact(tokens) + ' tokens"></div>');
+function heatIntensity(tokens, maxTokens) {
+  const value = finiteNumber(tokens, 'heatmap tokens');
+  if (value === 0) return 0;
+  const ratio = value / Math.max(1, maxTokens);
+  if (ratio < 0.2) return 1;
+  if (ratio < 0.45) return 2;
+  if (ratio < 0.72) return 3;
+  return 4;
+}
+
+function renderHeatmap(view) {
+  const daily = view.daily;
+  const maxTokens = Math.max(1, ...daily.map((day) => finiteNumber(day.tokens, 'daily tokens')));
+  const firstDow = daily[0] ? new Date(daily[0].date + 'T00:00:00').getDay() : 0;
+  const padded = Array(firstDow).fill(null).concat(daily);
+  const weeks = [];
+  for (let i = 0; i < padded.length; i += 7) weeks.push(padded.slice(i, i + 7));
+
+  const weekHtml = weeks.map((week) => {
+    let cells = '';
+    for (let i = 0; i < 7; i++) {
+      const day = week[i];
+      if (!day) {
+        cells += '<div class="heat-cell" style="visibility:hidden"></div>';
+        continue;
+      }
+      const level = heatIntensity(day.tokens, maxTokens);
+      cells += '<div class="heat-cell h' + level + '" data-date="' + day.date + '" data-tokens="' + day.tokens + '" data-cost="' + day.cost + '" data-messages="' + day.assistantMessages + '" data-sessions="' + day.sessions + '"></div>';
+    }
+    return '<div class="week">' + cells + '</div>';
+  }).join('');
+
+  $('heatmap').innerHTML =
+    '<div class="heatmap-scroller"><div class="dow-labels"><div></div><div>M</div><div></div><div>W</div><div></div><div>F</div><div></div></div><div class="weeks">' + weekHtml + '</div></div>' +
+    '<div class="heat-legend"><span>Less</span><span class="legend-cell h0"></span><span class="legend-cell h1"></span><span class="legend-cell h2"></span><span class="legend-cell h3"></span><span class="legend-cell h4"></span><span>More</span></div>';
+
+  for (const cell of document.querySelectorAll('.heat-cell[data-date]')) {
+    cell.addEventListener('mouseenter', showTooltip);
+    cell.addEventListener('mousemove', moveTooltip);
+    cell.addEventListener('mouseleave', hideTooltip);
   }
-  document.getElementById('heatmap').innerHTML = cells.join('');
-  const months = [];
-  const monthCursor = new Date(today);
-  monthCursor.setDate(1);
-  monthCursor.setMonth(monthCursor.getMonth() - 11);
-  for (let i = 0; i < 12; i++) {
-    const label = monthCursor.toLocaleDateString('zh-CN', { month: 'short' });
-    months.push('<span>' + label + '</span>');
-    monthCursor.setMonth(monthCursor.getMonth() + 1);
+}
+
+function showTooltip(event) {
+  const cell = event.currentTarget;
+  $('tooltip').innerHTML = '<div class="tooltip-title">' + fmtDateShort(cell.dataset.date) + '</div><div class="tooltip-main">' + fmtTokens(cell.dataset.tokens) + ' tok · ' + fmtCost(cell.dataset.cost) + '</div><div class="tooltip-sub">' + cell.dataset.messages + ' msgs · ' + cell.dataset.sessions + ' sessions</div>';
+  $('tooltip').style.display = 'block';
+  moveTooltip(event);
+}
+
+function moveTooltip(event) {
+  $('tooltip').style.left = event.clientX + 14 + 'px';
+  $('tooltip').style.top = event.clientY - 72 + 'px';
+}
+
+function hideTooltip() {
+  $('tooltip').style.display = 'none';
+}
+
+function renderSparkline(view) {
+  const daily = view.daily;
+  const series = view.days > 90 ? weeklySeries(daily) : daily.map((day) => ({ label: day.date, tokens: day.tokens }));
+  const width = 640;
+  const height = 72;
+  const pad = 4;
+  const maxTokens = Math.max(1, ...series.map((point) => finiteNumber(point.tokens, 'sparkline tokens')));
+  const points = series.map((point, index) => {
+    const x = series.length <= 1 ? pad : pad + index * ((width - pad * 2) / (series.length - 1));
+    const y = height - pad - (finiteNumber(point.tokens, 'sparkline tokens') / maxTokens) * (height - pad * 2);
+    return [x, y];
+  });
+  const line = points.length ? points.map((point, index) => (index ? 'L' : 'M') + point[0].toFixed(1) + ' ' + point[1].toFixed(1)).join(' ') : '';
+  const area = line ? line + ' L' + (points[points.length - 1][0]).toFixed(1) + ' ' + (height - pad) + ' L' + points[0][0].toFixed(1) + ' ' + (height - pad) + ' Z' : '';
+  $('sparkline').innerHTML = '<svg viewBox="0 0 ' + width + ' ' + height + '" preserveAspectRatio="none"><defs><linearGradient id="tokenGradient" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stop-color="#3b82f6" stop-opacity="0.35"/><stop offset="95%" stop-color="#3b82f6" stop-opacity="0.02"/></linearGradient></defs><path d="' + area + '" fill="url(#tokenGradient)"/><path d="' + line + '" fill="none" stroke="#3b82f6" stroke-width="2" vector-effect="non-scaling-stroke"/></svg>';
+}
+
+function weeklySeries(daily) {
+  const weeks = [];
+  for (let i = 0; i < daily.length; i += 7) {
+    const chunk = daily.slice(i, i + 7);
+    if (chunk.length) weeks.push({ label: chunk[0].date, tokens: sum(chunk, (day) => finiteNumber(day.tokens, 'weekly tokens')) });
   }
-  document.getElementById('monthRow').innerHTML = months.join('');
+  return weeks;
+}
+
+function renderModels(report) {
+  const models = [...report.topModels].sort((left, right) => {
+    const leftValue = finiteNumber(left[state.sortField], 'model ' + state.sortField);
+    const rightValue = finiteNumber(right[state.sortField], 'model ' + state.sortField);
+    return state.sortDir === 'desc' ? rightValue - leftValue : leftValue - rightValue;
+  });
+  const headers = [
+    ['model', 'Model'],
+    ['messages', 'Msgs'],
+    ['tokens', 'Tokens'],
+    ['repricedCost', 'Cost'],
+  ];
+  const headerHtml = headers.map(([field, label], index) => {
+    if (field === 'model') return '<th>' + label + '</th>';
+    const active = state.sortField === field;
+    const arrow = active ? (state.sortDir === 'desc' ? ' ↓' : ' ↑') : ' ↕';
+    const cls = index === 3 ? ' class="hide-sm"' : '';
+    return '<th' + cls + '><button class="sort" data-sort="' + field + '">' + label + arrow + '</button></th>';
+  }).join('') + '<th class="hide-sm">✓</th>';
+
+  const rows = models.map((model) => {
+    const provider = escapeHtml(model.provider);
+    const name = escapeHtml(model.model);
+    const hasPrice = priceSourceCount(model) > 0;
+    const unknown = model.unknownCostMessages > 0;
+    return '<tr><td><div class="model-provider ' + providerColor(model.provider) + '">' + provider + '</div><div class="model-name">' + name + '</div></td><td>' + nf.format(model.messages) + '</td><td>' + fmtTokens(model.tokens) + '</td><td class="hide-sm ' + (unknown ? 'price-unknown' : 'price-ok') + '">' + fmtCost(model.repricedCost, unknown) + '</td><td class="hide-sm ' + (hasPrice ? 'check' : 'no-check') + '">' + (hasPrice ? '✓' : '—') + '</td></tr>';
+  }).join('');
+
+  $('models').innerHTML = '<table><thead><tr>' + headerHtml + '</tr></thead><tbody>' + rows + '</tbody></table>';
+  for (const button of document.querySelectorAll('[data-sort]')) {
+    button.addEventListener('click', () => toggleSort(button.dataset.sort));
+  }
+}
+
+function providerColor(provider) {
+  const lower = String(provider).toLowerCase();
+  if (lower.includes('anthropic')) return 'rose';
+  if (lower.includes('openai')) return 'green';
+  if (lower.includes('google')) return 'amber';
+  return 'blue';
+}
+
+function toggleSort(field) {
+  if (state.sortField === field) state.sortDir = state.sortDir === 'desc' ? 'asc' : 'desc';
+  else {
+    state.sortField = field;
+    state.sortDir = 'desc';
+  }
+  renderModels(state.report);
+}
+
+function renderBreakdown(report) {
+  const tokens = report.totals.tokens;
+  const rows = [
+    ['Input', tokens.input, 'blue'],
+    ['Output', tokens.output, 'indigo'],
+    ['Cache Read', tokens.cacheRead, 'green'],
+    ['Cache Write', tokens.cacheWrite, 'amber'],
+  ];
+  $('tokenBreakdown').innerHTML = rows.map(([label, value, color]) => '<div class="breakdown-row"><span>' + label + '</span><strong class="' + color + '">' + fmtTokens(value) + '</strong></div>').join('');
+}
+
+function barRows(items, colorClass) {
+  const max = Math.max(1, ...items.map((item) => finiteNumber(item.count, 'bar count')));
+  if (!items.length) return '<div class="kpi-sub">No records</div>';
+  return items.map((item) => {
+    const count = finiteNumber(item.count, 'bar count');
+    const pct = Math.max(0, Math.min(100, count / max * 100));
+    return '<div class="bar-row"><span class="bar-name" title="' + escapeHtml(item.name) + '">' + escapeHtml(item.name) + '</span><span class="bar-track"><span class="bar-fill ' + colorClass + '" style="width:' + pct.toFixed(1) + '%"></span></span><span class="bar-count">' + fmtCount(item.count) + '</span></div>';
+  }).join('');
+}
+
+function renderLists(report) {
+  $('topTools').innerHTML = barRows(report.topTools, 'blue-bg');
+  $('topSkills').innerHTML = barRows(report.topSkills, 'violet-bg');
 }
 
 function renderInsights(report) {
   const i = report.insights;
-  document.getElementById('insights').innerHTML = [
-    row('快速模式', i.quickModePercent === undefined ? '-' : i.quickModePercent.toFixed(0) + '%'),
-    row('最常用的推理强度', escapeHtml(i.mostUsedThinkingLevel || '-')),
-    row('已探索的技能', nf.format(i.exploredSkills)),
-    row('使用的技能总数', nf.format(i.usedSkillsTotal)),
-    row('会话总数', nf.format(report.totals.scannedSessions) + '/' + nf.format(report.totals.listedSessions)),
-  ].join('');
+  const quick = i.quickModePercent === undefined ? '-' : i.quickModePercent.toFixed(0) + '%';
+  const tiles = [
+    ['Quick Mode', quick, 'of assistant messages', 'amber'],
+    ['Thinking', i.mostUsedThinkingLevel || '-', 'most used level', 'blue'],
+    ['Skills Used', i.usedSkillsTotal, 'of ' + i.exploredSkills + ' explored', 'green'],
+    ['Sessions', nf.format(report.totals.scannedSessions), (report.totals.listedSessions - report.totals.scannedSessions) + ' skipped', ''],
+  ];
+  $('insights').innerHTML = tiles.map(([label, value, sub, color]) => '<div class="panel tile"><span class="tile-label">' + label + '</span><span class="tile-value ' + color + '">' + escapeHtml(value) + '</span><span class="tile-sub">' + escapeHtml(sub) + '</span></div>').join('');
 }
 
-function renderTopTools(report) {
-  const merged = [...report.topSkills, ...report.topTools].slice(0, 12);
-  document.getElementById('topTools').innerHTML = merged.length
-    ? merged.map((item) => row(escapeHtml(item.name), nf.format(item.count) + ' 次运行')).join('')
-    : '<div class="muted">暂无工具或技能记录</div>';
+function renderMicroStats(report) {
+  const t = report.totals;
+  $('microStats').innerHTML = [
+    ['Peak Day', fmtTokens(t.peakDayTokens), 'blue'],
+    ['Partial Unk.', t.partialUnknownCostMessages, 'amber'],
+    ['Listed', nf.format(t.listedSessions), ''],
+  ].map(([label, value, color]) => '<div class="micro-row"><span>' + label + '</span><span class="' + color + '">' + value + '</span></div>').join('');
 }
 
-function renderModels(report) {
-  const rows = report.topModels.map((model) => '<tr><td>' + escapeHtml(model.provider + '/' + model.model) + '</td><td>' + compact(model.tokens) + '</td><td>' + nf.format(model.messages) + '</td><td>' + money(model.repricedCost, model.unknownCostMessages) + '</td></tr>').join('');
-  document.getElementById('models').innerHTML = '<table><thead><tr><th>模型</th><th>Token</th><th>消息</th><th>API 计费</th></tr></thead><tbody>' + rows + '</tbody></table>';
+function renderErrors(report) {
+  const errors = report.scanErrors || [];
+  $('errorJump').style.display = errors.length ? 'flex' : 'none';
+  $('errorJump').querySelector('span').textContent = errors.length + ' scan error' + (errors.length === 1 ? '' : 's');
+  $('scanErrors').style.display = errors.length ? 'block' : 'none';
+  $('scanErrors').className = 'panel errors' + (state.errorsExpanded ? ' expanded' : '');
+  $('scanErrors').innerHTML = '<button id="errorsToggle"><span><span class="amber">⚠</span> <b class="amber">Scan Errors</b> <span class="kpi-sub">— ' + errors.length + ' issues detected</span></span><span>' + (state.errorsExpanded ? '⌃' : '⌄') + '</span></button><div class="error-body">' + errors.map((error, index) => '<div class="error-line"><b>' + (index + 1) + '.</b>' + escapeHtml(error) + '</div>').join('') + '</div>';
+  $('errorsToggle').addEventListener('click', toggleErrors);
+}
+
+function toggleErrors() {
+  state.errorsExpanded = !state.errorsExpanded;
+  renderErrors(state.report);
 }
 
 function renderNotices(report) {
   const notices = [];
-  if (report.pricing.status !== 'ok') notices.push('LiteLLM 价格源不可用：' + report.pricing.error);
-  if (report.totals.unknownCostMessages || report.totals.partialUnknownCostMessages) notices.push('存在无法定价的模型消息：unknown=' + report.totals.unknownCostMessages + ', partial=' + report.totals.partialUnknownCostMessages + '。这些消息未按 0 美元处理。');
-  if (report.scanErrors.length) notices.push('扫描错误：\\n' + report.scanErrors.slice(0, 20).join('\\n'));
-  document.getElementById('notices').innerHTML = notices.map((text) => '<div class="notice">' + escapeHtml(text) + '</div>').join('');
+  if (report.pricing.status !== 'ok') notices.push('LiteLLM price source unavailable: ' + (report.pricing.error || 'unknown error'));
+  if (report.totals.unknownCostMessages || report.totals.partialUnknownCostMessages) notices.push('Some model messages cannot be fully priced: unknown=' + report.totals.unknownCostMessages + ', partial=' + report.totals.partialUnknownCostMessages + '. They are shown as + unknown, not silently priced as $0.');
+  $('notices').innerHTML = notices.map((notice) => '<div class="notice">' + escapeHtml(notice) + '</div>').join('');
 }
 
-async function load() {
-  const response = await fetch('/api/report');
-  if (!response.ok) throw new Error(await response.text());
-  const report = await response.json();
-  document.getElementById('subtitle').textContent = 'generated ' + new Date(report.generatedAt).toLocaleString();
-  renderSummary(report);
-  renderHeatmap(report);
-  renderInsights(report);
-  renderTopTools(report);
+function renderFooter(report) {
+  $('generatedAt').textContent = 'Generated ' + new Date(report.generatedAt).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  $('agentDir').textContent = report.agentDir;
+}
+
+function render() {
+  const report = state.report;
+  if (!report) return;
+  const view = currentView(report);
+  for (const button of document.querySelectorAll('.range-button')) button.classList.toggle('active', button.dataset.range === state.range);
+  $('activitySummary').textContent = fmtTokens(view.tokens) + ' · ' + fmtCost(view.cost);
+  $('trendRange').textContent = view.days + 'd trend';
+  $('unknownModels').textContent = report.totals.unknownCostMessages ? '⚠ ' + report.totals.unknownCostMessages + ' unknown' : '';
+  renderPricing(report);
+  renderKpis(report, view);
+  renderHeatmap(view);
+  renderSparkline(view);
   renderModels(report);
+  renderBreakdown(report);
+  renderLists(report);
+  renderInsights(report);
+  renderMicroStats(report);
+  renderErrors(report);
   renderNotices(report);
+  renderFooter(report);
 }
 
-load().catch((error) => {
-  document.getElementById('subtitle').textContent = 'failed';
-  document.getElementById('notices').innerHTML = '<div class="notice">' + escapeHtml(error.message) + '</div>';
+function renderFatal(error) {
+  $('kpis').innerHTML = '<div class="notice" style="grid-column:1/-1">' + escapeHtml(error.message || error) + '</div>';
+  $('pricingChip').className = 'pricing-chip pricing-bad';
+  $('pricingChip').innerHTML = '<span class="chip-dot"></span><span>Failed</span>';
+}
+
+async function loadReport() {
+  $('refreshButton').classList.add('loading');
+  try {
+    const response = await fetch('/api/report', { cache: 'no-store' });
+    if (!response.ok) throw new Error(await response.text());
+    state.report = await response.json();
+    render();
+  } catch (error) {
+    renderFatal(error);
+  } finally {
+    $('refreshButton').classList.remove('loading');
+  }
+}
+
+for (const button of document.querySelectorAll('.range-button')) {
+  button.addEventListener('click', () => {
+    state.range = button.dataset.range;
+    render();
+  });
+}
+$('refreshButton').addEventListener('click', loadReport);
+$('errorJump').addEventListener('click', () => {
+  state.errorsExpanded = true;
+  renderErrors(state.report);
+  $('scanErrors').scrollIntoView({ behavior: 'smooth', block: 'start' });
 });
+loadReport();
 </script>
 </body>
 </html>`;
