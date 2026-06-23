@@ -314,7 +314,8 @@ async function parseGuardedFetchBody(input: RequestInfo | URL, init: RequestInit
 }
 
 function shouldObserveResponse(response: Response): boolean {
-	return response.headers.get('content-type')?.toLowerCase().includes('text/event-stream') ?? false;
+	const contentType = response.headers.get('content-type')?.toLowerCase();
+	return !contentType || contentType.includes('text/event-stream');
 }
 
 async function bufferSseResponse(response: Response): Promise<{ body: Uint8Array; summary: RawStreamSummary }> {
