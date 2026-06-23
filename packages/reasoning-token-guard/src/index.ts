@@ -1,7 +1,6 @@
 import {
 	createAssistantMessageEventStream,
-	getApiProvider,
-	registerApiProvider,
+	streamSimpleOpenAICodexResponses,
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEvent,
@@ -9,7 +8,6 @@ import {
 	type Context,
 	type Model,
 	type SimpleStreamOptions,
-	type StreamOptions,
 } from '@earendil-works/pi-ai';
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 
@@ -18,7 +16,7 @@ const MIN_REASONING_TOKENS = 516;
 const MAX_TRANSPORT_RETRIES = 2;
 const GPT_MODEL_PATTERN = /^gpt/i;
 const GLOBAL_STATE_KEY = '__piBetterUxReasoningTokenGuard';
-const PATCH_VERSION = 9;
+const PATCH_VERSION = 10;
 const FORCE_SSE_ERROR_MESSAGE = 'reasoning-token-guard forces SSE transport for GPT replay';
 const VISIBLE_THINKING_TOKENIZER = 'generic-visible-v1';
 const WHITESPACE_PATTERN = /\s/u;
@@ -69,13 +67,11 @@ type RawCaptureState = {
 	installed?: boolean;
 	fetchPatched: boolean;
 	webSocketPatched: boolean;
-	apiProviderPatched: boolean;
+	providerReplayDepth: number;
 	fetchOriginal?: typeof fetch;
 	fetchWrapped?: typeof fetch;
 	webSocketOriginal?: WebSocketConstructorLike;
 	webSocketWrapped?: WebSocketConstructorLike;
-	apiProviderOriginal?: CodexApiProviderLike;
-	apiProviderWrapped?: CodexApiProviderLike;
 	notify?: (message: string, level: 'info' | 'warning' | 'error') => void;
 	byResponseId: Map<string, ReasoningTokenMeasurement>;
 	retryByResponseId: Map<string, RawRetryInfo>;
@@ -107,12 +103,6 @@ type PatchedWebSocketPrototype = {
 	__reasoningTokenGuardAddEventListener?: (type: string, listener: (event: unknown) => void) => void;
 };
 
-type CodexApiProviderLike = {
-	api: Api;
-	stream(model: Model<Api>, context: Context, options?: StreamOptions): AssistantMessageEventStream;
-	streamSimple(model: Model<Api>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
-};
-
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null;
 }
@@ -142,7 +132,7 @@ function getRawCaptureState(): RawCaptureState {
 	const state = globalScope[GLOBAL_STATE_KEY] ?? {};
 	state.fetchPatched ??= false;
 	state.webSocketPatched ??= false;
-	state.apiProviderPatched ??= false;
+	state.providerReplayDepth ??= 0;
 	state.byResponseId ??= new Map();
 	state.retryByResponseId ??= new Map();
 	globalScope[GLOBAL_STATE_KEY] = state;
@@ -335,8 +325,9 @@ function recordRawResponse(state: RawCaptureState, summary: RawStreamSummary, re
 	});
 }
 
-function shouldReplayRawResponse(response: Response, summary: RawStreamSummary): boolean {
+function shouldReplayRawResponse(state: RawCaptureState, response: Response, summary: RawStreamSummary): boolean {
 	return response.ok
+		&& state.providerReplayDepth === 0
 		&& summary.terminal
 		&& !summary.hasToolCall
 		&& summary.measurement !== undefined
@@ -384,7 +375,7 @@ function installFetchCapture(state: RawCaptureState): void {
 
 			const { body, summary } = await bufferSseResponse(response);
 			if (summary.measurement
-				&& shouldReplayRawResponse(response, summary)
+				&& shouldReplayRawResponse(state, response, summary)
 				&& rejectedReasoningTokens.length < MAX_TRANSPORT_RETRIES) {
 				const measurement = summary.measurement;
 				const model = typeof guardedPayload.model === 'string' ? guardedPayload.model : 'gpt';
@@ -459,26 +450,6 @@ function installWebSocketCapture(state: RawCaptureState): void {
 	state.webSocketPatched = true;
 }
 
-function installCodexProviderUsagePatch(state: RawCaptureState): void {
-	const currentProvider = getApiProvider('openai-codex-responses');
-	if (!currentProvider) return;
-	if (currentProvider === state.apiProviderWrapped && state.patchVersion === PATCH_VERSION) return;
-
-	const baseProvider = currentProvider === state.apiProviderWrapped && state.apiProviderOriginal
-		? state.apiProviderOriginal
-		: currentProvider;
-	const wrappedProvider: CodexApiProviderLike = {
-		api: 'openai-codex-responses',
-		stream: (model, context, options) => wrapCodexProviderStream(() => baseProvider.stream(model, context, options), state),
-		streamSimple: (model, context, options) => wrapCodexProviderStream(() => baseProvider.streamSimple(model, context, options), state),
-	};
-
-	registerApiProvider(wrappedProvider, ENTRY_TYPE);
-	state.apiProviderOriginal = baseProvider;
-	state.apiProviderWrapped = wrappedProvider;
-	state.apiProviderPatched = true;
-}
-
 function wrapCodexProviderStream(
 	createInnerStream: () => AssistantMessageEventStream,
 	state: RawCaptureState,
@@ -492,22 +463,28 @@ function wrapCodexProviderStream(
 			let finalMeasurement: ReasoningTokenMeasurement | undefined;
 
 			try {
-				for await (const event of createInnerStream()) {
-					if (event.type === 'done' && event.message.role === 'assistant') {
-						const message = withTerminalReasoningTokens(event.message, state);
-						finalMessage = message;
-						finalMeasurement = getReasoningTokens(message, state);
-						events.push({ ...event, message });
-						continue;
+				state.providerReplayDepth += 1;
+				try {
+					const innerStream = createInnerStream();
+					for await (const event of innerStream) {
+						if (event.type === 'done' && event.message.role === 'assistant') {
+							const message = withTerminalReasoningTokens(event.message, state);
+							finalMessage = message;
+							finalMeasurement = getReasoningTokens(message, state);
+							events.push({ ...event, message });
+							continue;
+						}
+						if (event.type === 'error' && event.error.role === 'assistant') {
+							const error = withTerminalReasoningTokens(event.error, state);
+							finalMessage = error;
+							finalMeasurement = getReasoningTokens(error, state);
+							events.push({ ...event, error });
+							continue;
+						}
+						events.push(event);
 					}
-					if (event.type === 'error' && event.error.role === 'assistant') {
-						const error = withTerminalReasoningTokens(event.error, state);
-						finalMessage = error;
-						finalMeasurement = getReasoningTokens(error, state);
-						events.push({ ...event, error });
-						continue;
-					}
-					events.push(event);
+				} finally {
+					state.providerReplayDepth -= 1;
 				}
 			} catch (error) {
 				events.push({
@@ -524,6 +501,10 @@ function wrapCodexProviderStream(
 				&& rejectedReasoningTokens.length < MAX_TRANSPORT_RETRIES) {
 				rejectedReasoningTokens.push(finalMeasurement.tokens);
 				notifyReplay(state, finalMessage.model, rejectedReasoningTokens.length, finalMeasurement);
+				if (finalMessage.responseId) {
+					state.byResponseId.delete(finalMessage.responseId);
+					state.retryByResponseId.delete(finalMessage.responseId);
+				}
 				continue;
 			}
 
@@ -658,7 +639,6 @@ function installRawReasoningTokenCapture(): RawCaptureState {
 	const state = getRawCaptureState();
 	installFetchCapture(state);
 	installWebSocketCapture(state);
-	installCodexProviderUsagePatch(state);
 	state.installed = true;
 	state.patchVersion = PATCH_VERSION;
 	return state;
@@ -684,7 +664,7 @@ function extractMessageReasoningTokens(message: AssistantMessage): ReasoningToke
 	for (const [source, path] of candidates) {
 		const tokens = readNumber(message, path);
 		if (tokens === undefined) continue;
-		if (recordedSource?.startsWith('visibleThinking.')) {
+		if (recordedSource?.includes('visibleThinking.')) {
 			return {
 				tokens,
 				source: recordedSource,
@@ -900,6 +880,17 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 	const rawCaptureState = installRawReasoningTokenCapture();
 	const warnedUnavailable = { value: false };
 	const followUpRetryState = { attempts: 0, totalAttempts: 0 };
+
+	pi.registerProvider('openai-codex', {
+		api: 'openai-codex-responses',
+		streamSimple: (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => wrapCodexProviderStream(
+			() => streamSimpleOpenAICodexResponses(model as Model<'openai-codex-responses'>, context, {
+				...options,
+				transport: 'sse',
+			}),
+			rawCaptureState,
+		),
+	});
 
 	pi.on('before_provider_request', (_event, ctx) => {
 		rawCaptureState.notify = ctx.hasUI ? ctx.ui.notify.bind(ctx.ui) : undefined;
