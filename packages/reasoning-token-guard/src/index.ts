@@ -12,11 +12,12 @@ import {
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 
 const ENTRY_TYPE = 'reasoning-token-guard';
+const STATUS_ENTRY_TYPE = 'reasoning-token-guard-status';
 const MIN_REASONING_TOKENS = 516;
 const MAX_TRANSPORT_RETRIES = 2;
 const GPT_MODEL_PATTERN = /^gpt/i;
 const GLOBAL_STATE_KEY = '__piBetterUxReasoningTokenGuard';
-const PATCH_VERSION = 10;
+const PATCH_VERSION = 11;
 const FORCE_SSE_ERROR_MESSAGE = 'reasoning-token-guard forces SSE transport for GPT replay';
 const VISIBLE_THINKING_TOKENIZER = 'generic-visible-v1';
 const WHITESPACE_PATTERN = /\s/u;
@@ -26,11 +27,13 @@ type ReasoningTokenMeasurement = {
 	tokens: number;
 	source: string;
 	kind: 'real' | 'visibleThinkingFallback';
+	rawResponseUsage?: Record<string, unknown>;
 	visibleThinkingChars?: number;
 	visibleThinkingTokenizer?: string;
 };
 
 type RawRetryInfo = {
+	source: 'rawTransport' | 'providerOverride';
 	attempts: number;
 	rejectedReasoningTokens: number[];
 	finalReasoningTokens?: number;
@@ -38,6 +41,8 @@ type RawRetryInfo = {
 
 type ReasoningTokenAudit = {
 	version: 1;
+	patchVersion: number;
+	providerOverrideRegistered: boolean;
 	provider: string;
 	model: string;
 	api: string;
@@ -55,11 +60,23 @@ type ReasoningTokenAudit = {
 	totalTokens: number;
 	blocked: boolean;
 	transportRetries: number;
+	retrySource?: RawRetryInfo['source'];
 	followUpRetries: number;
 	queuedFollowUpRetry: boolean;
 	rejectedReasoningTokens: number[];
 	maxTransportRetries: number;
+	rawResponseUsage?: Record<string, unknown>;
 	note?: string;
+};
+
+type ReasoningTokenGuardStatus = {
+	version: 1;
+	patchVersion: number;
+	providerOverrideRegistered: boolean;
+	provider: string;
+	api: string;
+	threshold: number;
+	maxTransportRetries: number;
 };
 
 type RawCaptureState = {
@@ -80,6 +97,7 @@ type RawCaptureState = {
 type RawStreamSummary = {
 	responseId?: string;
 	measurement?: ReasoningTokenMeasurement;
+	rawResponseUsage?: Record<string, unknown>;
 	visibleThinkingText: string;
 	hasToolCall: boolean;
 	terminal: boolean;
@@ -139,7 +157,11 @@ function getRawCaptureState(): RawCaptureState {
 	return state as RawCaptureState;
 }
 
-function extractReasoningMeasurement(value: unknown, sourcePrefix: string): ReasoningTokenMeasurement | undefined {
+function extractReasoningMeasurement(
+	value: unknown,
+	sourcePrefix: string,
+	rawResponseUsage?: Record<string, unknown>,
+): ReasoningTokenMeasurement | undefined {
 	const candidates: Array<[string, string[]]> = [
 		['usage.output_tokens_details.reasoning_tokens', ['usage', 'output_tokens_details', 'reasoning_tokens']],
 		['usage.output_tokens_details.reasoning_output_tokens', ['usage', 'output_tokens_details', 'reasoning_output_tokens']],
@@ -154,7 +176,14 @@ function extractReasoningMeasurement(value: unknown, sourcePrefix: string): Reas
 
 	for (const [source, path] of candidates) {
 		const tokens = readNumber(value, path);
-		if (tokens !== undefined) return { tokens, source: `${sourcePrefix}.${source}`, kind: 'real' };
+		if (tokens !== undefined) {
+			return {
+				tokens,
+				source: `${sourcePrefix}.${source}`,
+				kind: 'real',
+				...(rawResponseUsage ? { rawResponseUsage } : {}),
+			};
+		}
 	}
 
 	return undefined;
@@ -193,12 +222,18 @@ function updateRawStreamSummary(summary: RawStreamSummary, event: unknown): void
 			? event.id
 			: undefined;
 	if (responseId) summary.responseId = responseId;
+	const rawResponseUsage = isRecord(response?.usage) ? response.usage : undefined;
+	if (rawResponseUsage) summary.rawResponseUsage = rawResponseUsage;
 
-	const measurement = (response ? extractReasoningMeasurement(response, 'raw.response') : undefined)
+	const measurement = (response ? extractReasoningMeasurement(response, 'raw.response', rawResponseUsage) : undefined)
 		?? extractReasoningMeasurement(event, 'raw');
 	if (measurement) summary.measurement = measurement;
 	else if (summary.visibleThinkingText.trim()) {
-		summary.measurement = createVisibleThinkingMeasurement(summary.visibleThinkingText, 'raw.visibleThinking');
+		summary.measurement = createVisibleThinkingMeasurement(
+			summary.visibleThinkingText,
+			'raw.visibleThinking',
+			summary.rawResponseUsage,
+		);
 	}
 
 	if (eventType === 'response.completed'
@@ -315,10 +350,16 @@ async function bufferSseResponse(response: Response): Promise<{ body: Uint8Array
 	return { body, summary };
 }
 
-function recordRawResponse(state: RawCaptureState, summary: RawStreamSummary, rejectedReasoningTokens: number[]): void {
+function recordRawResponse(
+	state: RawCaptureState,
+	summary: RawStreamSummary,
+	rejectedReasoningTokens: number[],
+	source: RawRetryInfo['source'] = 'rawTransport',
+): void {
 	if (!summary.responseId) return;
 	if (summary.measurement) state.byResponseId.set(summary.responseId, summary.measurement);
 	state.retryByResponseId.set(summary.responseId, {
+		source,
 		attempts: rejectedReasoningTokens.length,
 		rejectedReasoningTokens: [...rejectedReasoningTokens],
 		...(summary.measurement ? { finalReasoningTokens: summary.measurement.tokens } : {}),
@@ -543,6 +584,7 @@ function recordProviderRetry(
 	if (!message?.responseId || rejectedReasoningTokens.length === 0) return;
 	const existingRetry = state.retryByResponseId.get(message.responseId);
 	state.retryByResponseId.set(message.responseId, {
+		source: 'providerOverride',
 		attempts: (existingRetry?.attempts ?? 0) + rejectedReasoningTokens.length,
 		rejectedReasoningTokens: [
 			...(existingRetry?.rejectedReasoningTokens ?? []),
@@ -658,6 +700,10 @@ function extractMessageReasoningTokens(message: AssistantMessage): ReasoningToke
 		['details.reasoning_tokens', ['details', 'reasoning_tokens']],
 	];
 	const recordedSource = readString(message, ['usage', 'reasoningTokenSource']);
+	const rawResponseUsage = isRecord(message.usage)
+		&& isRecord(message.usage.reasoningTokenRawResponseUsage)
+		? message.usage.reasoningTokenRawResponseUsage
+		: undefined;
 	const visibleThinkingChars = readNumber(message, ['usage', 'visibleThinkingChars']);
 	const visibleThinkingTokenizer = readString(message, ['usage', 'visibleThinkingTokenizer']);
 
@@ -669,11 +715,12 @@ function extractMessageReasoningTokens(message: AssistantMessage): ReasoningToke
 				tokens,
 				source: recordedSource,
 				kind: 'visibleThinkingFallback',
+				...(rawResponseUsage ? { rawResponseUsage } : {}),
 				...(visibleThinkingChars !== undefined ? { visibleThinkingChars } : {}),
 				...(visibleThinkingTokenizer ? { visibleThinkingTokenizer } : {}),
 			};
 		}
-		return { tokens, source: recordedSource ?? source, kind: 'real' };
+		return { tokens, source: recordedSource ?? source, kind: 'real', ...(rawResponseUsage ? { rawResponseUsage } : {}) };
 	}
 
 	return undefined;
@@ -750,11 +797,16 @@ function extractOpenAIReasoningItemText(item: Record<string, unknown>): string |
 	return content || undefined;
 }
 
-function createVisibleThinkingMeasurement(visibleThinkingText: string, sourcePrefix: string): ReasoningTokenMeasurement {
+function createVisibleThinkingMeasurement(
+	visibleThinkingText: string,
+	sourcePrefix: string,
+	rawResponseUsage?: Record<string, unknown>,
+): ReasoningTokenMeasurement {
 	return {
 		tokens: countGenericVisibleThinkingTokens(visibleThinkingText),
 		source: `${sourcePrefix}.${VISIBLE_THINKING_TOKENIZER}`,
 		kind: 'visibleThinkingFallback',
+		...(rawResponseUsage ? { rawResponseUsage } : {}),
 		visibleThinkingChars: visibleThinkingText.length,
 		visibleThinkingTokenizer: VISIBLE_THINKING_TOKENIZER,
 	};
@@ -814,6 +866,7 @@ function withReasoningTokens(
 			reasoningTokens: measurement.tokens,
 			reasoningTokenSource: measurement.source,
 			reasoningTokenKind: measurement.kind,
+			...(measurement.rawResponseUsage ? { reasoningTokenRawResponseUsage: measurement.rawResponseUsage } : {}),
 			...(measurement.kind === 'visibleThinkingFallback' ? {
 				visibleThinkingTokens: measurement.tokens,
 				visibleThinkingChars: measurement.visibleThinkingChars,
@@ -837,6 +890,7 @@ function buildBlockedText(
 		`Source: ${measurement.source}`,
 		`Transport retries: ${rawRetry?.attempts ?? 0}/${MAX_TRANSPORT_RETRIES}`,
 	];
+	if (rawRetry?.source) lines.push(`Retry source: ${rawRetry.source}`);
 	if (queuedFollowUpRetryAttempt !== undefined) {
 		lines.push(`Follow-up retry queued: ${queuedFollowUpRetryAttempt}/${MAX_TRANSPORT_RETRIES}`);
 	}
@@ -892,6 +946,18 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 		),
 	});
 
+	pi.on('session_start', () => {
+		pi.appendEntry<ReasoningTokenGuardStatus>(STATUS_ENTRY_TYPE, {
+			version: 1,
+			patchVersion: PATCH_VERSION,
+			providerOverrideRegistered: true,
+			provider: 'openai-codex',
+			api: 'openai-codex-responses',
+			threshold: MIN_REASONING_TOKENS,
+			maxTransportRetries: MAX_TRANSPORT_RETRIES,
+		});
+	});
+
 	pi.on('before_provider_request', (_event, ctx) => {
 		rawCaptureState.notify = ctx.hasUI ? ctx.ui.notify.bind(ctx.ui) : undefined;
 	});
@@ -921,6 +987,8 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 
 		pi.appendEntry<ReasoningTokenAudit>(ENTRY_TYPE, {
 			version: 1,
+			patchVersion: PATCH_VERSION,
+			providerOverrideRegistered: true,
 			provider: message.provider,
 			model: message.model,
 			api: message.api,
@@ -942,10 +1010,12 @@ export default function reasoningTokenGuard(pi: ExtensionAPI) {
 			totalTokens: message.usage.totalTokens,
 			blocked,
 			transportRetries,
+			...(rawRetry?.source ? { retrySource: rawRetry.source } : {}),
 			followUpRetries: followUpRetriesAfterMessage,
 			queuedFollowUpRetry: queuedFollowUpRetryAttempt !== undefined,
 			rejectedReasoningTokens: rawRetry?.rejectedReasoningTokens ?? [],
 			maxTransportRetries: MAX_TRANSPORT_RETRIES,
+			...(measurement?.rawResponseUsage ? { rawResponseUsage: measurement.rawResponseUsage } : {}),
 			...(!measurement ? {
 				note: 'No real reasoning token field or visible thinking text; output tokens are not used as a proxy.',
 			} : measurement.kind === 'visibleThinkingFallback' ? {
