@@ -18,7 +18,7 @@ const MIN_REASONING_TOKENS = 516;
 const MAX_TRANSPORT_RETRIES = 2;
 const GPT_MODEL_PATTERN = /^gpt/i;
 const GLOBAL_STATE_KEY = '__piBetterUxReasoningTokenGuard';
-const PATCH_VERSION = 8;
+const PATCH_VERSION = 9;
 const FORCE_SSE_ERROR_MESSAGE = 'reasoning-token-guard forces SSE transport for GPT replay';
 const VISIBLE_THINKING_TOKENIZER = 'generic-visible-v1';
 const WHITESPACE_PATTERN = /\s/u;
@@ -208,7 +208,7 @@ function updateRawStreamSummary(summary: RawStreamSummary, event: unknown): void
 		?? extractReasoningMeasurement(event, 'raw');
 	if (measurement) summary.measurement = measurement;
 	else if (summary.visibleThinkingText.trim()) {
-		summary.measurement = createVisibleThinkingMeasurement(summary.visibleThinkingText);
+		summary.measurement = createVisibleThinkingMeasurement(summary.visibleThinkingText, 'raw.visibleThinking');
 	}
 
 	if (eventType === 'response.completed'
@@ -770,10 +770,10 @@ function extractOpenAIReasoningItemText(item: Record<string, unknown>): string |
 	return content || undefined;
 }
 
-function createVisibleThinkingMeasurement(visibleThinkingText: string): ReasoningTokenMeasurement {
+function createVisibleThinkingMeasurement(visibleThinkingText: string, sourcePrefix: string): ReasoningTokenMeasurement {
 	return {
 		tokens: countGenericVisibleThinkingTokens(visibleThinkingText),
-		source: `visibleThinking.${VISIBLE_THINKING_TOKENIZER}`,
+		source: `${sourcePrefix}.${VISIBLE_THINKING_TOKENIZER}`,
 		kind: 'visibleThinkingFallback',
 		visibleThinkingChars: visibleThinkingText.length,
 		visibleThinkingTokenizer: VISIBLE_THINKING_TOKENIZER,
@@ -787,7 +787,7 @@ function extractVisibleThinkingMeasurement(message: AssistantMessage): Reasoning
 		.join('\n');
 	if (!visibleThinkingText) return undefined;
 
-	return createVisibleThinkingMeasurement(visibleThinkingText);
+	return createVisibleThinkingMeasurement(visibleThinkingText, 'message.visibleThinking');
 }
 
 function getRealReasoningTokens(
