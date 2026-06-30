@@ -22,6 +22,9 @@
   "files": [
     "packages/*/package.json",
     "packages/*/src/**",
+    "packages/*/config/**",
+    "packages/*/README.md",
+    "packages/*/CHANGELOG.md",
     "README.md",
     "LICENSE"
   ],
@@ -34,13 +37,16 @@
     "@earendil-works/pi-tui": "*"
   },
   "dependencies": {
-    "diff": "^8.0.4"
+    "@shikijs/cli": "^4.0.2",
+    "diff": "^9.0.0"
   },
   "publishConfig": {
     "access": "public"
   },
   "pi": {
     "extensions": [
+      "packages/claude-style-tools/src/index.ts",
+      "packages/claude-style-tools/src/spinner.ts",
       "packages/code-block-fix/src/code-block-fix.ts",
       "packages/co-dev/src/co-dev.ts",
       "packages/rtk/src/rtk.ts",

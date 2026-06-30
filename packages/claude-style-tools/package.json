@@ -1,0 +1,29 @@
+{
+  "name": "pi-claude-style-tools-codex",
+  "version": "0.1.0",
+  "description": "Claude Code-style Pi tool rendering with Codex exec_command, write_stdin, and apply_patch support",
+  "type": "module",
+  "private": true,
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "claude-code",
+    "codex",
+    "tool-renderer"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./src/index.ts",
+      "./src/spinner.ts"
+    ]
+  },
+  "dependencies": {
+    "@shikijs/cli": "^4.0.2",
+    "diff": "^9.0.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}

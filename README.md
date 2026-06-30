@@ -19,6 +19,7 @@ pi -e .
 
 | Extension | Path | What it does | Notes |
 |---|---|---|---|
+| `claude-style-tools` | `packages/claude-style-tools/src/index.ts`, `packages/claude-style-tools/src/spinner.ts` | Vendors Claude Code-style tool rows, spinner, grouped tool calls, Shiki diffs, and Codex `exec_command` / `write_stdin` / `apply_patch` rendering. | Forked from `pi-claude-style-tools`; load both files together. |
 | `code-block-fix` | `packages/code-block-fix/src/code-block-fix.ts` | Renders markdown code blocks with Unicode box borders. | Monkey-patches Pi markdown rendering. |
 | `co-dev` | `packages/co-dev/src/co-dev.ts` | Runs a second-model review loop after each agent answer. | Configure with `/co-dev`; requires a usable Pi model and API key. |
 | `reasoning-token-guard` | `packages/reasoning-token-guard/src/reasoning-token-guard.ts` | Persists GPT reasoning token metadata and retries final replies below 516 reasoning tokens. | Only enforces when the provider exposes a real reasoning token field; it never treats total output tokens as reasoning tokens. |
