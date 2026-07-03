@@ -64,6 +64,8 @@ export type GrepSearchResponse = {
 
 export type FindFilesRequest = {
 	query: string;
+	pathQuery?: string;
+	glob?: string;
 	limit?: number;
 	cursor?: string;
 };
@@ -74,6 +76,8 @@ export type FindFilesResponse = {
 	nextCursor?: string;
 	totalMatched?: number;
 	totalFiles?: number;
+	scope?: ResolvedPath;
+	constraintQuery?: string;
 };
 
 export type RelatedFilesResponse = {
@@ -110,8 +114,11 @@ export type MultiGrepRequest = GrepBaseRequest & {
 export type FileCursorPayload = {
 	query: string;
 	searchQuery?: string;
+	pathQuery?: string;
+	glob?: string;
 	pageIndex: number;
 	pageSize: number;
+	skipInPage?: number;
 };
 
 export type StoredGrepContinuation = {

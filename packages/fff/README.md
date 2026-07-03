@@ -8,8 +8,8 @@ Forked from [ShpetimA/pi-fff](https://github.com/ShpetimA/pi-fff) (MIT).
 
 - **Fuzzy path resolution for `read`** — agent 输入近似路径（如 `src/idx` 或 `readme`），fff 在 `tool_call` 阶段解析为精确路径后传给内置 read
 - **Fuzzy scope resolution for `grep`** — agent 给 grep 的 `path` 参数可以是模糊目录/文件名，fff 解析后传给内置 grep
-- **`find_files` 工具** — 模糊文件查找，排名候选列表，支持分页
-- **`fff_multi_grep` 工具** — 同时搜索多个 literal pattern
+- **`find_files` 工具** — 模糊文件查找，排名候选列表，支持 `path` scope、`glob` filter 和分页。给定目录 scope 时会在该目录单独建立 FFF 索引，避免父目录 `.gitignore` 把子仓库整体排除后搜不到代码
+- **`fff_multi_grep` 工具** — 同时搜索多个 literal pattern；给定目录 scope 时同样使用 scoped FFF 索引，返回可从当前 cwd 读取的 rebased path
 - **`@` 编辑器自动补全** — 在 TUI 输入框用 `@` 触发文件模糊补全
 - **`/fff-features`** — 交互式开关各功能
 - **`/fff-status`** — 查看索引状态

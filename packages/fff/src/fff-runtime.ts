@@ -163,6 +163,50 @@ function combineConstraints(...parts: Array<string | undefined>): string | undef
 	return combined.length > 0 ? combined.join(" ") : undefined;
 }
 
+function joinRelativePath(prefix: string, relativePath: string): string {
+	const normalizedPrefix = normalizeSlashes(prefix).replace(/^\.\//, "").replace(/\/+$/, "");
+	const normalizedPath = normalizeSlashes(relativePath).replace(/^\/+/, "");
+	if (!normalizedPrefix || normalizedPrefix === ".") return normalizedPath;
+	return `${normalizedPrefix}/${normalizedPath}`;
+}
+
+function globPatternToRegex(pattern: string, matchBasename: boolean): RegExp {
+	let source = "";
+	for (let index = 0; index < pattern.length; index += 1) {
+		const char = pattern[index];
+		const next = pattern[index + 1];
+		if (char === "*" && next === "*" && pattern[index + 2] === "/") {
+			source += "(?:.*/)?";
+			index += 2;
+			continue;
+		}
+		if (char === "*" && next === "*") {
+			source += ".*";
+			index += 1;
+			continue;
+		}
+		if (char === "*") {
+			source += matchBasename ? ".*" : "[^/]*";
+			continue;
+		}
+		if (char === "?") {
+			source += matchBasename ? "." : "[^/]";
+			continue;
+		}
+		source += char && /[|\\{}()[\]^$+?.]/.test(char) ? `\\${char}` : char;
+	}
+	return new RegExp(`^${source}$`);
+}
+
+function matchesGlob(relativePath: string, glob: string | undefined): boolean {
+	const normalizedGlob = nativeConstraintForGlob(glob);
+	if (!normalizedGlob) return true;
+	const normalizedPath = normalizeSlashes(relativePath);
+	const matchBasename = !normalizedGlob.includes("/");
+	const target = matchBasename ? normalizedPath.split("/").pop() ?? normalizedPath : normalizedPath;
+	return globPatternToRegex(normalizedGlob, matchBasename).test(target);
+}
+
 function encodeJsonCursor(prefix: string, payload: unknown): string {
 	return `${prefix}${Buffer.from(JSON.stringify(payload), "utf8").toString("base64url")}`;
 }
@@ -231,6 +275,8 @@ export class FffRuntime {
 	private finder: FileFinder | null = null;
 	private initPromise: Promise<AppResult<FileFinder, RuntimeInitializationError>> | null = null;
 	private loadError: RuntimeInitializationError | null = null;
+	private readonly scopedFinders = new Map<string, FileFinder>();
+	private readonly scopedInitPromises = new Map<string, Promise<AppResult<FileFinder, RuntimeInitializationError>>>();
 	private grepCursorCounter = 0;
 	private readonly grepContinuations = new Map<string, StoredGrepContinuation>();
 
@@ -255,15 +301,84 @@ export class FffRuntime {
 		return initialized;
 	}
 
+	private async createFinder(basePath: string, step: string): Promise<AppResult<FileFinder, RuntimeInitializationError>> {
+		const root = resolve(getAgentDir(), "pi-fff");
+		const rootResult = await Result.tryPromise({
+			try: () => mkdir(root, { recursive: true }),
+			catch: (cause) => new RuntimeInitializationError({ cwd: this.cwd, step: "create runtime directory", cause }),
+		});
+		if (rootResult.isErr()) return propagateError(rootResult);
+
+		const paths = getProjectDatabasePaths(root, basePath);
+		const dbResult = await Result.tryPromise({
+			try: () => mkdir(paths.dbDir, { recursive: true }),
+			catch: (cause) => new RuntimeInitializationError({ cwd: this.cwd, step: "create database directory", cause }),
+		});
+		if (dbResult.isErr()) return propagateError(dbResult);
+
+		const created = Result.try({
+			try: () =>
+				FileFinder.create({
+					basePath,
+					aiMode: true,
+					frecencyDbPath: paths.frecencyDbPath,
+					historyDbPath: paths.historyDbPath,
+				}),
+			catch: (cause) => new RuntimeInitializationError({ cwd: this.cwd, step, cause }),
+		});
+		if (created.isErr()) return propagateError(created);
+		if (!created.value.ok) {
+			return errResult(new RuntimeInitializationError({ cwd: this.cwd, step, cause: created.value.error }));
+		}
+
+		const finder = created.value.value;
+		void await Result.tryPromise({
+			try: () => finder.waitForScan(500),
+			catch: (cause) => finderFailure("waitForScan", cause instanceof Error ? cause.message : String(cause), cause),
+		});
+		return Result.ok(finder);
+	}
+
+	private async ensureScopedFinder(basePath: string): Promise<AppResult<FileFinder, RuntimeInitializationError>> {
+		const existing = this.scopedFinders.get(basePath);
+		if (existing) return Result.ok(existing);
+
+		let initPromise = this.scopedInitPromises.get(basePath);
+		if (!initPromise) {
+			initPromise = this.createFinder(basePath, "create scoped file finder");
+			this.scopedInitPromises.set(basePath, initPromise);
+		}
+
+		const initialized = await initPromise;
+		this.scopedInitPromises.delete(basePath);
+		if (initialized.isErr()) return initialized;
+		this.scopedFinders.set(basePath, initialized.value);
+		return initialized;
+	}
+
+	private rebaseCandidate(candidate: FffFileCandidate, scope: ResolvedPath | undefined): FffFileCandidate {
+		if (!scope) return candidate;
+		const relativePath = joinRelativePath(scope.relativePath, candidate.item.relativePath);
+		return { item: { ...candidate.item, relativePath, path: resolve(scope.absolutePath, candidate.item.relativePath) }, score: candidate.score };
+	}
+
+	private rebaseGrepItems(items: GrepMatch[], scope: ResolvedPath | undefined): GrepMatch[] {
+		if (!scope) return items;
+		return items.map((item) => ({ ...item, relativePath: joinRelativePath(scope.relativePath, item.relativePath), path: resolve(scope.absolutePath, item.relativePath) }));
+	}
+
 	dispose(): void {
 		void Result.try({
 			try: () => {
 				if (this.finder && this.finder !== this.options.finder) this.finder.destroy();
+				for (const finder of this.scopedFinders.values()) finder.destroy();
 			},
 			catch: (cause) => finderFailure("destroy", cause instanceof Error ? cause.message : String(cause), cause),
 		});
 		this.finder = this.options.finder ?? null;
 		this.initPromise = null;
+		this.scopedFinders.clear();
+		this.scopedInitPromises.clear();
 		this.grepContinuations.clear();
 	}
 
@@ -340,58 +455,122 @@ export class FffRuntime {
 	}
 
 	async findFiles(request: FindFilesRequest): Promise<FindFilesResult> {
-		const finderResult = await this.ensure();
-		if (finderResult.isErr()) return propagateError(finderResult);
 		const normalizedQuery = normalizePathQuery(request.query);
 		if (!normalizedQuery) {
 			return errResult(new EmptyFileQueryError({ query: request.query }));
 		}
+		const normalizedPathQuery = request.pathQuery ? normalizePathQuery(request.pathQuery) : undefined;
+		const normalizedGlob = nativeConstraintForGlob(request.glob);
+
+		const scopeResult = normalizedPathQuery ? await this.resolvePath(normalizedPathQuery, { allowDirectory: true, limit: DEFAULT_FILE_CANDIDATE_LIMIT }) : undefined;
+		if (scopeResult?.isErr()) {
+			if (
+				AmbiguousPathError.is(scopeResult.error)
+				|| EmptyPathQueryError.is(scopeResult.error)
+				|| MissingPathError.is(scopeResult.error)
+			) {
+				return Result.ok({
+					items: [],
+					formatted: formatPathResolutionError("find_files scope", request.pathQuery ?? "", scopeResult.error),
+				});
+			}
+			return propagateError(scopeResult);
+		}
+
+		const resolvedScope = scopeResult && scopeResult.isOk() ? scopeResult.value : undefined;
+		const useScopedFinder = resolvedScope?.pathType === "directory" && resolve(resolvedScope.absolutePath) !== resolve(this.basePath);
+		const finderResult = useScopedFinder ? await this.ensureScopedFinder(resolvedScope.absolutePath) : await this.ensure();
+		if (finderResult.isErr()) return propagateError(finderResult);
+		const rebaseScope = useScopedFinder ? resolvedScope : undefined;
+		const detailConstraintQuery = combineConstraints(nativeConstraintForScope(resolvedScope), normalizedGlob);
 
 		const pageSize = Math.max(1, request.limit ?? DEFAULT_FIND_FILES_LIMIT);
 		let pageIndex = 0;
+		let skipInPage = 0;
 		let searchQuery = normalizedQuery;
 		if (request.cursor) {
 			const payload = decodeJsonCursor<FileCursorPayload>(request.cursor, FIND_FILES_CURSOR_PREFIX);
-			if (!payload || payload.query !== normalizedQuery || payload.pageSize !== pageSize) {
+			if (
+				!payload
+				|| payload.query !== normalizedQuery
+				|| payload.pageSize !== pageSize
+				|| (payload.pathQuery ?? undefined) !== normalizedPathQuery
+				|| (payload.glob ?? undefined) !== normalizedGlob
+			) {
 				return errResult(new InvalidFindFilesCursorError({ query: normalizedQuery, cursor: request.cursor }));
 			}
 			pageIndex = payload.pageIndex;
+			skipInPage = payload.skipInPage ?? 0;
 			searchQuery = payload.searchQuery ?? payload.query;
 		}
 
-		let search = safeFinderCall("fileSearch", () => finderResult.value.fileSearch(searchQuery, { pageIndex, pageSize }));
-		if (pageIndex === 0 && search.isOk() && search.value.items.length === 0) {
-			const shorterQuery = shortenWaterfallQuery(normalizedQuery);
-			if (shorterQuery) {
-				searchQuery = shorterQuery;
-				search = safeFinderCall("fileSearch", () => finderResult.value.fileSearch(searchQuery, { pageIndex, pageSize }));
-			}
-		}
-		if (search.isErr()) return propagateError(search);
+		const items: FffFileCandidate[] = [];
+		let totalMatched: number | undefined;
+		let totalFiles: number | undefined;
+		let nextPageIndex = pageIndex;
+		let nextSkipInPage = skipInPage;
+		let hasMore = false;
 
-		const items = search.value.items.map((item, index) => normalizeCandidate(item, search.value.scores[index]));
-		const nextOffset = (pageIndex + 1) * pageSize;
-		const nextCursor = nextOffset < search.value.totalMatched
+		while (items.length < pageSize) {
+			let search = safeFinderCall("fileSearch", () => finderResult.value.fileSearch(searchQuery, { pageIndex: nextPageIndex, pageSize }));
+			if (nextPageIndex === 0 && search.isOk() && search.value.items.length === 0) {
+				const shorterQuery = shortenWaterfallQuery(normalizedQuery);
+				if (shorterQuery) {
+					searchQuery = shorterQuery;
+					search = safeFinderCall("fileSearch", () => finderResult.value.fileSearch(searchQuery, { pageIndex: nextPageIndex, pageSize }));
+				}
+			}
+			if (search.isErr()) return propagateError(search);
+
+			totalMatched = search.value.totalMatched;
+			totalFiles = search.value.totalFiles;
+			const pageItems = search.value.items
+				.map((item, index) => normalizeCandidate(item, search.value.scores[index]))
+				.filter((candidate) => matchesGlob(candidate.item.relativePath, normalizedGlob))
+				.map((candidate) => this.rebaseCandidate(candidate, rebaseScope));
+			const availableItems = pageItems.slice(nextSkipInPage);
+			const remainingCapacity = pageSize - items.length;
+			items.push(...availableItems.slice(0, remainingCapacity));
+
+			if (availableItems.length > remainingCapacity) {
+				nextSkipInPage += remainingCapacity;
+				hasMore = true;
+				break;
+			}
+
+			nextPageIndex += pageSize;
+			nextSkipInPage = 0;
+			hasMore = nextPageIndex < search.value.totalMatched;
+			if (!hasMore || search.value.items.length === 0 || !normalizedGlob) break;
+		}
+
+		const nextCursor = totalMatched !== undefined && hasMore
 			? encodeJsonCursor(FIND_FILES_CURSOR_PREFIX, {
 				query: normalizedQuery,
 				searchQuery,
-				pageIndex: pageIndex + 1,
+				pathQuery: normalizedPathQuery,
+				glob: normalizedGlob,
+				pageIndex: nextPageIndex,
 				pageSize,
+				skipInPage: nextSkipInPage,
 			} satisfies FileCursorPayload)
 			: undefined;
+		const filteredTotalMatched = normalizedGlob || (resolvedScope && !useScopedFinder) ? undefined : totalMatched;
 
 		return Result.ok({
 			items,
 			formatted: formatFindFilesText(normalizedQuery, items, {
-				totalMatched: search.value.totalMatched,
-				totalFiles: search.value.totalFiles,
+				totalMatched: filteredTotalMatched,
+				totalFiles,
 				nextCursor,
-				pageIndex,
+				pageIndex: Math.floor(pageIndex / pageSize),
 				pageSize,
 			}),
 			nextCursor,
-			totalMatched: search.value.totalMatched,
-			totalFiles: search.value.totalFiles,
+			totalMatched: filteredTotalMatched,
+			totalFiles,
+			scope: resolvedScope,
+			constraintQuery: detailConstraintQuery,
 		});
 	}
 
@@ -579,12 +758,13 @@ export class FffRuntime {
 		request: SingleGrepRequest,
 		constraintQuery: string | undefined,
 		resolvedScope: ResolvedPath | undefined,
+		rebaseScope: ResolvedPath | undefined,
 	): Promise<GrepSearchResponse | null> {
 		const broadened = broadenGrepPattern(request.pattern);
 		if (broadened) {
 			const broadenedResult = this.runFinderGrep(finder, { ...request, pattern: broadened }, constraintQuery, null);
 			if (broadenedResult.isErr()) return null;
-			const broadenedItems = broadenedResult.value.items.slice(0, request.limit);
+			const broadenedItems = this.rebaseGrepItems(broadenedResult.value.items, rebaseScope).slice(0, request.limit);
 			if (broadenedItems.length > 0) {
 				const built = buildGrepText(broadenedItems, {
 					limit: request.limit,
@@ -612,7 +792,7 @@ export class FffRuntime {
 			if (fuzzyPattern) {
 				const fuzzyResult = this.runFinderGrep(finder, { ...request, pattern: fuzzyPattern, mode: "fuzzy" }, constraintQuery, null);
 				if (fuzzyResult.isOk()) {
-					const fuzzyItems = fuzzyResult.value.items.slice(0, request.limit);
+				const fuzzyItems = this.rebaseGrepItems(fuzzyResult.value.items, rebaseScope).slice(0, request.limit);
 					if (fuzzyItems.length > 0) {
 						return {
 							items: fuzzyItems,
@@ -627,15 +807,19 @@ export class FffRuntime {
 		}
 
 		if (request.pattern.includes("/")) {
-			const pathCandidates = await this.searchFileCandidates(request.pattern, 1);
-			if (pathCandidates.isOk() && isStrongPathCandidate(pathCandidates.value[0], request.pattern)) {
+			const pathSearch = safeFinderCall("fileSearch", () => finder.fileSearch(request.pattern, { pageSize: DEFAULT_FILE_CANDIDATE_LIMIT }));
+			if (pathSearch.isOk()) {
+				const firstItem = pathSearch.value.items[0];
+				if (!firstItem) return null;
+				const pathCandidate = this.rebaseCandidate(normalizeCandidate(firstItem, pathSearch.value.scores[0]), rebaseScope);
+				if (!isStrongPathCandidate(pathCandidate, request.pattern)) return null;
 				return {
 					items: [],
-					formatted: `0 content matches. But there is a relevant file path: ${pathCandidates.value[0]?.item.relativePath}`,
+					formatted: `0 content matches. But there is a relevant file path: ${pathCandidate.item.relativePath}`,
 					linesTruncated: false,
 					scope: resolvedScope,
 					constraintQuery,
-					suggestedReadPath: pathCandidates.value[0]?.item.relativePath,
+					suggestedReadPath: pathCandidate.item.relativePath,
 				};
 			}
 		}
@@ -648,6 +832,7 @@ export class FffRuntime {
 		request: MultiGrepRequest,
 		constraintQuery: string | undefined,
 		resolvedScope: ResolvedPath | undefined,
+		rebaseScope: ResolvedPath | undefined,
 	): Promise<GrepSearchResponse | null> {
 		for (const pattern of request.patterns) {
 			const fallbackResult = this.runFinderGrep(finder, {
@@ -664,7 +849,7 @@ export class FffRuntime {
 				outputMode: request.outputMode,
 			}, constraintQuery, null);
 			if (fallbackResult.isErr()) continue;
-			const fallbackItems = fallbackResult.value.items.slice(0, request.limit);
+			const fallbackItems = this.rebaseGrepItems(fallbackResult.value.items, rebaseScope).slice(0, request.limit);
 			if (fallbackItems.length === 0) continue;
 			const built = buildGrepText(fallbackItems, {
 				limit: request.limit,
@@ -689,10 +874,6 @@ export class FffRuntime {
 	}
 
 	private async runGrep(request: SingleGrepRequest | MultiGrepRequest): Promise<GrepSearchResult> {
-		const finderResult = await this.ensure();
-		if (finderResult.isErr()) return propagateError(finderResult);
-		const finder = finderResult.value;
-
 		const scopeResult = request.pathQuery ? await this.resolvePath(request.pathQuery, { allowDirectory: true, limit: DEFAULT_FILE_CANDIDATE_LIMIT }) : undefined;
 		if (scopeResult?.isErr()) {
 			if (
@@ -710,8 +891,13 @@ export class FffRuntime {
 		}
 
 		const resolvedScope = scopeResult && scopeResult.isOk() ? scopeResult.value : undefined;
+		const useScopedFinder = resolvedScope?.pathType === "directory" && resolve(resolvedScope.absolutePath) !== resolve(this.basePath);
+		const finderResult = useScopedFinder ? await this.ensureScopedFinder(resolvedScope.absolutePath) : await this.ensure();
+		if (finderResult.isErr()) return propagateError(finderResult);
+		const finder = finderResult.value;
+		const rebaseScope = useScopedFinder ? resolvedScope : undefined;
 		const constraintQuery = combineConstraints(
-			nativeConstraintForScope(resolvedScope),
+			useScopedFinder ? undefined : nativeConstraintForScope(resolvedScope),
 			nativeConstraintForGlob(request.glob),
 			request.constraints?.trim() ? request.constraints.trim() : undefined,
 		);
@@ -748,17 +934,17 @@ export class FffRuntime {
 
 			regexFallbackError = result.value.regexFallbackError ?? regexFallbackError;
 			engineCursor = result.value.nextCursor;
-			remainingItems.push(...result.value.items);
+			remainingItems.push(...this.rebaseGrepItems(result.value.items, rebaseScope));
 			takeFromRemaining();
 			if (!engineCursor && remainingItems.length === 0) break;
 		}
 
 		if (items.length === 0 && !request.cursor) {
 			if (request.kind === "single") {
-				const fallback = await this.buildNoMatchFallback(finder, request, constraintQuery, resolvedScope);
+				const fallback = await this.buildNoMatchFallback(finder, request, constraintQuery, resolvedScope, rebaseScope);
 				if (fallback) return Result.ok(fallback);
 			} else {
-				const fallback = await this.buildMultiNoMatchFallback(finder, request, constraintQuery, resolvedScope);
+				const fallback = await this.buildMultiNoMatchFallback(finder, request, constraintQuery, resolvedScope, rebaseScope);
 				if (fallback) return Result.ok(fallback);
 			}
 		}
@@ -817,43 +1003,8 @@ export class FffRuntime {
 	}
 
 	private async initialize(): Promise<AppResult<FileFinder, RuntimeInitializationError>> {
-		const root = resolve(getAgentDir(), "pi-fff");
-		const rootResult = await Result.tryPromise({
-			try: () => mkdir(root, { recursive: true }),
-			catch: (cause) => new RuntimeInitializationError({ cwd: this.cwd, step: "create runtime directory", cause }),
-		});
-		if (rootResult.isErr()) return propagateError(rootResult);
-
 		const projectRoot = this.options.projectRoot ?? await resolveProjectRoot(this.cwd);
 		this.basePath = projectRoot;
-		const paths = getProjectDatabasePaths(root, projectRoot);
-		const dbDir = paths.dbDir;
-		const dbResult = await Result.tryPromise({
-			try: () => mkdir(dbDir, { recursive: true }),
-			catch: (cause) => new RuntimeInitializationError({ cwd: this.cwd, step: "create database directory", cause }),
-		});
-		if (dbResult.isErr()) return propagateError(dbResult);
-
-		const created = Result.try({
-			try: () =>
-				FileFinder.create({
-					basePath: projectRoot,
-					aiMode: true,
-					frecencyDbPath: paths.frecencyDbPath,
-					historyDbPath: paths.historyDbPath,
-				}),
-			catch: (cause) => new RuntimeInitializationError({ cwd: this.cwd, step: "create file finder", cause }),
-		});
-		if (created.isErr()) return propagateError(created);
-		if (!created.value.ok) {
-			return errResult(new RuntimeInitializationError({ cwd: this.cwd, step: "create file finder", cause: created.value.error }));
-		}
-
-		const finder = created.value.value;
-		void await Result.tryPromise({
-			try: () => finder.waitForScan(500),
-			catch: (cause) => finderFailure("waitForScan", cause instanceof Error ? cause.message : String(cause), cause),
-		});
-		return Result.ok(finder);
+		return this.createFinder(projectRoot, "create file finder");
 	}
 }

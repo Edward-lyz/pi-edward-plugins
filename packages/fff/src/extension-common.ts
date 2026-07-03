@@ -42,7 +42,7 @@ export const FEATURE_DEFINITIONS: FeatureDefinition[] = [
 	{
 		id: "builtInGrepEnhancement",
 		label: "Built-in grep enhancement",
-		description: "Use FFF-backed content search for built-in grep (requires /reload after enabling)",
+		description: "Resolve approximate grep path scopes before built-in grep (requires /reload after enabling)",
 	},
 	{ id: "agentTools", label: "Agent tools", description: "Enable find_files / fff_multi_grep" },
 	{ id: "statusUI", label: "Status UI", description: "Show startup notices" },
@@ -137,6 +137,8 @@ export function buildFindFilesDetails(result?: FindFilesResponse, disabledFeatur
 		nextCursor: result?.nextCursor ?? null,
 		totalMatched: result?.totalMatched ?? null,
 		totalFiles: result?.totalFiles ?? null,
+		resolvedScope: result?.scope?.relativePath ?? null,
+		constraints: result?.constraintQuery ?? null,
 		...buildErrorDetails(error),
 		disabled: disabledFeature !== undefined,
 		feature: disabledFeature ?? null,

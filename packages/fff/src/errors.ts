@@ -140,6 +140,6 @@ export class GrepCursorMismatchError extends TaggedError("GrepCursorMismatchErro
 
 export type FeatureStateLoadError = FeatureStateReadError | FeatureStateParseError;
 export type PathResolutionError = EmptyPathQueryError | MissingPathError | AmbiguousPathError | RuntimeInitializationError | FinderOperationError;
-export type FindFilesError = EmptyFileQueryError | InvalidFindFilesCursorError | RuntimeInitializationError | FinderOperationError;
+export type FindFilesError = EmptyFileQueryError | InvalidFindFilesCursorError | PathResolutionError;
 export type RelatedFilesError = PathResolutionError | FinderOperationError;
 export type GrepSearchError = InvalidGrepCursorError | GrepCursorMismatchError | PathResolutionError | FinderOperationError;

@@ -129,11 +129,13 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "find_files",
 		label: "Find Files",
-		description: "Browse ranked file candidates for a fuzzy query using fff.",
+		description: "Browse ranked file candidates for a fuzzy query using fff, optionally scoped by path/glob.",
 		promptSnippet: "Explore which files exist for a topic before reading one.",
 		promptGuidelines: ["Use find_files when exploring a topic, looking for a file, or wanting ranked candidates before reading."],
 		parameters: Type.Object({
 			query: Type.String({ description: "Fuzzy file query" }),
+			path: Type.Optional(Type.String({ description: "Optional exact or fuzzy file/folder scope" })),
+			glob: Type.Optional(Type.String({ description: "Optional glob filter such as *.ts" })),
 			limit: Type.Optional(Type.Number({ description: "Maximum number of results (default: 20)" })),
 			cursor: Type.Optional(Type.String({ description: "Cursor from a previous find_files result" })),
 		}),
@@ -145,7 +147,7 @@ export default function (pi: ExtensionAPI) {
 			if (!rt) {
 				return { content: [{ type: "text", text: FFF_RUNTIME_NOT_READY_TEXT }], details: buildFindFilesDetails() };
 			}
-			const result = await rt.findFiles({ query: params.query, limit: params.limit, cursor: params.cursor });
+			const result = await rt.findFiles({ query: params.query, pathQuery: params.path, glob: params.glob, limit: params.limit, cursor: params.cursor });
 			return result.match({
 				err: (error) => ({ content: [{ type: "text" as const, text: error.message }], details: buildFindFilesDetails(undefined, undefined, error) }),
 				ok: (value) => ({ content: [{ type: "text" as const, text: value.formatted }], details: buildFindFilesDetails(value) }),
