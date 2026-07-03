@@ -37,7 +37,9 @@
     "@earendil-works/pi-tui": "*"
   },
   "dependencies": {
+    "@ff-labs/fff-node": "^0.9.4",
     "@shikijs/cli": "^4.0.2",
+    "better-result": "^2.8.2",
     "diff": "^9.0.0"
   },
   "publishConfig": {
@@ -53,7 +55,8 @@
       "packages/reasoning-token-guard/src/reasoning-token-guard.ts",
       "packages/statusline/src/statusline.ts",
       "packages/system-context/src/system-context.ts",
-      "packages/usage-report/src/usage-report.ts"
+      "packages/usage-report/src/usage-report.ts",
+      "packages/fff/src/index.ts"
     ]
   }
 }
