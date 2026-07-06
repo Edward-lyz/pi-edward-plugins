@@ -25,7 +25,9 @@
     "packages/*/config/**",
     "packages/*/README.md",
     "packages/*/CHANGELOG.md",
+    "packages/*/LICENSE",
     "README.md",
+    "install.sh",
     "LICENSE"
   ],
   "scripts": {
@@ -34,7 +36,8 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*"
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
   },
   "dependencies": {
     "@ff-labs/fff-node": "^0.9.4",
@@ -50,11 +53,10 @@
       "packages/claude-style-tools/src/index.ts",
       "packages/claude-style-tools/src/spinner.ts",
       "packages/code-block-fix/src/code-block-fix.ts",
-      "packages/co-dev/src/co-dev.ts",
       "packages/rtk/src/rtk.ts",
-      "packages/reasoning-token-guard/src/reasoning-token-guard.ts",
       "packages/statusline/src/statusline.ts",
       "packages/system-context/src/system-context.ts",
+      "packages/subagent/src/index.ts",
       "packages/usage-report/src/usage-report.ts",
       "packages/fff/src/index.ts"
     ]
