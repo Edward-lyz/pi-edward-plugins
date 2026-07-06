@@ -1,5 +1,6 @@
+import { getSupportedThinkingLevels, type Model } from '@earendil-works/pi-ai';
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext } from '@earendil-works/pi-coding-agent';
-import { Text } from '@earendil-works/pi-tui';
+import { Key, matchesKey, Text, truncateToWidth } from '@earendil-works/pi-tui';
 import { Type } from 'typebox';
 import { AgentManager } from './agent-manager.js';
 import { getAgentConversation, SUBAGENT_TOOL_NAMES } from './agent-runner.js';
@@ -115,6 +116,159 @@ function sameModel(left: { provider: string; id: string } | undefined, right: { 
   return left.provider === right.provider && left.id === right.id;
 }
 
+function modelKey(model: { provider: string; id: string }): string {
+  return `${model.provider}/${model.id}`;
+}
+
+function modelDisplayName(model: { name?: string; provider: string; id: string }): string {
+  return model.name ? `${model.name} (${modelKey(model)})` : modelKey(model);
+}
+
+interface SelectOption<T> {
+  label: string;
+  detail?: string;
+  value: T;
+}
+
+async function chooseOption<T>(
+  ctx: ExtensionCommandContext,
+  title: string,
+  help: string,
+  options: SelectOption<T>[],
+  initialIndex: number,
+): Promise<T | undefined> {
+  if (options.length === 0) return undefined;
+  return await ctx.ui.custom<T | undefined>((tui, theme, _keybindings, done) => {
+    let selectedIndex = Math.max(0, Math.min(initialIndex, options.length - 1));
+    const visibleCount = 12;
+    const refresh = () => tui.requestRender();
+    const move = (nextIndex: number) => {
+      selectedIndex = Math.max(0, Math.min(nextIndex, options.length - 1));
+      refresh();
+    };
+
+    return {
+      render(width: number) {
+        const lines: string[] = [];
+        const add = (line: string) => lines.push(truncateToWidth(line, width));
+        const maxStart = Math.max(0, options.length - visibleCount);
+        const start = Math.min(maxStart, Math.max(0, selectedIndex - Math.floor(visibleCount / 2)));
+        const visibleOptions = options.slice(start, start + visibleCount);
+
+        add(theme.fg('accent', theme.bold(title)));
+        add(theme.fg('dim', help));
+        lines.push('');
+
+        for (let i = 0; i < visibleOptions.length; i++) {
+          const optionIndex = start + i;
+          const option = visibleOptions[i]!;
+          const selected = optionIndex === selectedIndex;
+          const prefix = selected ? theme.fg('accent', '› ') : '  ';
+          const label = selected ? theme.fg('accent', option.label) : theme.fg('text', option.label);
+          add(`${prefix}${label}`);
+          if (option.detail) add(`  ${theme.fg('muted', option.detail)}`);
+        }
+
+        lines.push('');
+        add(theme.fg('dim', `↑↓ select · Enter confirm · Esc cancel · ${selectedIndex + 1}/${options.length}`));
+        return lines;
+      },
+      invalidate() {},
+      handleInput(data: string) {
+        if (matchesKey(data, Key.up)) {
+          move(selectedIndex - 1);
+          return;
+        }
+        if (matchesKey(data, Key.down)) {
+          move(selectedIndex + 1);
+          return;
+        }
+        if (matchesKey(data, Key.pageUp)) {
+          move(selectedIndex - visibleCount);
+          return;
+        }
+        if (matchesKey(data, Key.pageDown)) {
+          move(selectedIndex + visibleCount);
+          return;
+        }
+        if (matchesKey(data, 'home')) {
+          move(0);
+          return;
+        }
+        if (matchesKey(data, 'end')) {
+          move(options.length - 1);
+          return;
+        }
+        if (matchesKey(data, Key.enter)) {
+          done(options[selectedIndex]!.value);
+          return;
+        }
+        if (matchesKey(data, Key.escape)) {
+          done(undefined);
+        }
+      },
+    };
+  });
+}
+
+function importedModels(ctx: ExtensionCommandContext): Model<any>[] {
+  return [...ctx.modelRegistry.getAvailable()].sort((left, right) => modelKey(left).localeCompare(modelKey(right)));
+}
+
+async function runSubagentDefaultsWizard(ctx: ExtensionCommandContext): Promise<void> {
+  const settings = readSubagentSettings();
+  const models = importedModels(ctx);
+  if (models.length === 0) {
+    ctx.ui.notify('No imported Pi models are available. Import or configure a model first, then run /subagent again.', 'error');
+    return;
+  }
+
+  const initialModelIndex = settings.defaultModel ? models.findIndex(model => modelKey(model) === settings.defaultModel) : 0;
+  if (settings.defaultModel && initialModelIndex === -1) {
+    ctx.ui.notify(`Current subagent default model is not imported: ${settings.defaultModel}. Choose an imported model to replace it.`, 'warning');
+  }
+  const selectedModel = await chooseOption(
+    ctx,
+    'Subagent default model',
+    'Only currently imported/configured Pi models are listed.',
+    models.map(model => ({
+      label: modelDisplayName(model),
+      detail: `context ${model.contextWindow?.toLocaleString() ?? 'unknown'} · provider ${model.provider}`,
+      value: model,
+    })),
+    initialModelIndex === -1 ? 0 : initialModelIndex,
+  );
+  if (!selectedModel) {
+    ctx.ui.notify('Subagent defaults unchanged', 'info');
+    return;
+  }
+
+  const thinkingLevels = getSupportedThinkingLevels(selectedModel).filter((level): level is ThinkingLevel =>
+    ['off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(level),
+  );
+  const initialThinkingIndex = settings.defaultThinking ? thinkingLevels.indexOf(settings.defaultThinking) : 0;
+  const selectedThinking = await chooseOption<ThinkingLevel>(
+    ctx,
+    'Subagent thinking level',
+    `Choose the default thinking level for ${modelKey(selectedModel)}.`,
+    thinkingLevels.map(level => ({
+      label: level,
+      detail: level === 'off' ? 'no extended thinking' : 'use model reasoning budget',
+      value: level,
+    })),
+    initialThinkingIndex === -1 ? 0 : initialThinkingIndex,
+  );
+  if (!selectedThinking) {
+    ctx.ui.notify('Subagent defaults unchanged', 'info');
+    return;
+  }
+
+  settings.defaultModel = modelKey(selectedModel);
+  settings.defaultThinking = selectedThinking;
+  const path = writeSubagentSettings(settings);
+  ctx.ui.notify(`Subagent defaults saved\nmodel: ${settings.defaultModel}\nthinking: ${settings.defaultThinking}\n${path}`, 'info');
+}
+
 
 function formatRecordResult(record: AgentRecord, verbose: boolean): string {
   const durationMs = (record.completedAt ?? Date.now()) - record.startedAt;
@@ -151,7 +305,8 @@ ${conversation}`;
 function commandUsage(): string {
   return [
     'Usage:',
-    '  /subagent',
+    '  /subagent  # open model + thinking picker',
+    '  /subagent status',
     '  /subagent model <provider/model 或 fuzzy name>',
     '  /subagent model inherit',
     '  /subagent thinking <off|minimal|low|medium|high|xhigh>',
@@ -163,13 +318,18 @@ function commandUsage(): string {
 async function handleSubagentCommand(args: string, ctx: ExtensionCommandContext): Promise<void> {
   const trimmed = args.trim();
   if (!trimmed) {
-    ctx.ui.notify(`Subagent defaults\n${formatSubagentSettings(readSubagentSettings())}`, 'info');
+    await runSubagentDefaultsWizard(ctx);
     return;
   }
 
   const [command, ...rest] = trimmed.split(/\s+/);
   const value = rest.join(' ').trim();
   const settings = readSubagentSettings();
+
+  if (command === 'status') {
+    ctx.ui.notify(`Subagent defaults\n${formatSubagentSettings(settings)}`, 'info');
+    return;
+  }
 
   if (command === 'clear') {
     const path = writeSubagentSettings({});
@@ -195,7 +355,7 @@ async function handleSubagentCommand(args: string, ctx: ExtensionCommandContext)
     }
     settings.defaultModel = value;
     const path = writeSubagentSettings(settings);
-    ctx.ui.notify(`Subagent default model set to ${resolved.provider}/${resolved.id}\n${path}`, 'info');
+    ctx.ui.notify(`Subagent default model set to ${modelKey(resolved)}\n${path}`, 'info');
     return;
   }
 

@@ -70,10 +70,11 @@ Completed background results stay in memory until they are retrieved with `wait_
 
 ### `/subagent`
 
-Shows or updates global defaults stored at `~/.pi/agent/subagent.json`.
+Shows or updates global defaults stored at `~/.pi/agent/subagent.json`. Running `/subagent` with no arguments opens a two-step picker: first choose one of the currently imported Pi models, then choose the thinking level supported by that model.
 
 ```text
 /subagent
+/subagent status
 /subagent model anthropic/claude-sonnet-4-6
 /subagent model inherit
 /subagent thinking high

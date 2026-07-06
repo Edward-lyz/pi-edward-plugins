@@ -1547,9 +1547,9 @@ export default function usageReport(pi: ExtensionAPI) {
   });
 
   pi.registerCommand('usage-report', {
-    description: 'Show Pi token activity and API cost report: status, open, start [port], stop',
+    description: 'Open the Pi token activity and API cost report dashboard: open, status, start [port], stop',
     handler: async (args, ctx) => {
-      const [action = 'status', portArg] = args.trim().split(/\s+/).filter(Boolean);
+      const [action = 'open', portArg] = args.trim().split(/\s+/).filter(Boolean);
 
       if (action === 'status') {
         const url = server.getUrl();

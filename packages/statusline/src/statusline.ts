@@ -176,9 +176,10 @@ function calculateRates(message: AssistantMessage, state: RuntimeState, endedAt:
 	return { ttft, output: message.usage.output / outputSeconds, outputEstimated: false };
 }
 
-function buildStatusLine(ctx: ExtensionContext, state: RuntimeState): string {
+function buildStatusLine(ctx: ExtensionContext, state: RuntimeState, pi: ExtensionAPI): string {
 	const theme = ctx.ui.theme;
-	const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : 'no-model';
+	const thinkingLevel = pi.getThinkingLevel();
+	const model = ctx.model ? `${ctx.model.provider}/${ctx.model.id} · thinking ${thinkingLevel}` : `no-model · thinking ${thinkingLevel}`;
 	const ttft = state.roundStartedAt !== undefined && state.roundFirstAssistantAt === undefined
 		? Math.max(0.001, (Date.now() - state.roundStartedAt) / 1000)
 		: state.roundFirstAssistantAt === undefined
@@ -222,7 +223,7 @@ export default function statusline(pi: ExtensionAPI) {
 				},
 				invalidate() {},
 				render(width: number): string[] {
-					return [truncateToWidth(buildStatusLine(ctx, state), width, '…')];
+					return [truncateToWidth(buildStatusLine(ctx, state, pi), width, '…')];
 				},
 			};
 		});
@@ -234,6 +235,7 @@ export default function statusline(pi: ExtensionAPI) {
 	});
 
 	pi.on('model_select', refresh);
+	pi.on('thinking_level_select', refresh);
 
 	pi.on('before_agent_start', () => {
 		state.roundStartedAt = Date.now();
