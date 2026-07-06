@@ -2,6 +2,7 @@ import type { AssistantMessage, Usage } from '@earendil-works/pi-ai';
 import {
   SessionManager,
   getAgentDir,
+  parseSkillBlock,
   type ExtensionAPI,
   type ExtensionContext,
   type SessionEntry,
@@ -10,7 +11,7 @@ import {
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
 const DEFAULT_PORT = 30143;
-const SERVER_VERSION = 2;
+const SERVER_VERSION = 3;
 const LITELLM_PRICE_URL = 'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';
 const PRICE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
@@ -38,23 +39,26 @@ type LiteLlmPriceLoad = {
   error: string | undefined;
 };
 
+type DayModelBucket = {
+  provider: string;
+  model: string;
+  messages: number;
+  tokens: TokenTotals;
+  repricedCost: number;
+  unknownCostMessages: number;
+  hasPrice: boolean;
+};
+
 type DayBucket = {
   date: string;
   tokens: TokenTotals;
   cost: number;
   assistantMessages: number;
+  toolCalls: number;
   sessions: Set<string>;
-};
-
-type ModelBucket = {
-  provider: string;
-  model: string;
-  messages: number;
-  tokens: TokenTotals;
-  recordedCost: number;
-  repricedCost: number;
-  unknownCostMessages: number;
-  priceSources: Map<string, number>;
+  models: Map<string, DayModelBucket>;
+  tools: Map<string, number>;
+  skills: Map<string, number>;
 };
 
 type LongestTask = {
@@ -78,8 +82,6 @@ type ReportAccumulator = {
   tokens: TokenTotals;
   activeDays: Set<string>;
   days: Map<string, DayBucket>;
-  models: Map<string, ModelBucket>;
-  tools: Map<string, number>;
   skills: Map<string, number>;
   thinkingLevels: Map<string, number>;
   longestTask: LongestTask | undefined;
@@ -122,20 +124,20 @@ type UsageReport = {
     tokens: number;
     cost: number;
     assistantMessages: number;
+    toolCalls: number;
     sessions: number;
+    models: Array<{
+      provider: string;
+      model: string;
+      messages: number;
+      tokens: number;
+      repricedCost: number;
+      unknownCostMessages: number;
+      hasPrice: boolean;
+    }>;
+    tools: Array<{ name: string; count: number }>;
+    skills: Array<{ name: string; count: number }>;
   }>;
-  topModels: Array<{
-    provider: string;
-    model: string;
-    messages: number;
-    tokens: number;
-    recordedCost: number;
-    repricedCost: number;
-    unknownCostMessages: number;
-    priceSources: Record<string, number>;
-  }>;
-  topTools: Array<{ name: string; count: number }>;
-  topSkills: Array<{ name: string; count: number }>;
   scanErrors: string[];
 };
 
@@ -215,32 +217,24 @@ function extractMessageText(content: unknown): string {
   return parts.join('\n');
 }
 
-function extractSkillReferences(text: string): string[] {
-  const skills: string[] = [];
-  for (const match of text.matchAll(/(?:^|\s)\$([a-zA-Z][\w-]*)/g)) {
-    skills.push(`$${match[1]}`);
-  }
-  for (const match of text.matchAll(/(?:^|\s)\/skill:([a-zA-Z][\w-]*)/g)) {
-    skills.push(`$${match[1]}`);
-  }
-  return skills;
-}
-
-function addToolCall(toolName: string, toolCallId: string | undefined, seenToolCallIds: Set<string>, acc: ReportAccumulator): void {
+function addToolCall(toolName: string, toolCallId: string | undefined, seenToolCallIds: Set<string>, timestampMs: number, acc: ReportAccumulator): void {
   if (toolCallId && seenToolCallIds.has(toolCallId)) return;
   if (toolCallId) seenToolCallIds.add(toolCallId);
-  incrementCounter(acc.tools, toolName.split('.').pop() ?? toolName);
+  const name = toolName.split('.').pop() ?? toolName;
   acc.toolCalls += 1;
+  const day = getDayBucket(acc, localDateKey(timestampMs));
+  incrementCounter(day.tools, name);
+  day.toolCalls += 1;
 }
 
-function collectAssistantToolCalls(content: unknown, seenToolCallIds: Set<string>, acc: ReportAccumulator): void {
+function collectAssistantToolCalls(content: unknown, seenToolCallIds: Set<string>, timestampMs: number, acc: ReportAccumulator): void {
   if (!Array.isArray(content)) return;
   for (const block of content) {
     if (!isRecord(block)) continue;
     if (block.type !== 'toolCall') continue;
     if (typeof block.name !== 'string') continue;
     const toolCallId = typeof block.id === 'string' ? block.id : undefined;
-    addToolCall(block.name, toolCallId, seenToolCallIds, acc);
+    addToolCall(block.name, toolCallId, seenToolCallIds, timestampMs, acc);
   }
 }
 
@@ -322,27 +316,8 @@ function calculateCost(usage: Usage, price: Price | undefined): { knownCost: num
 function getDayBucket(acc: ReportAccumulator, dateKey: string): DayBucket {
   let bucket = acc.days.get(dateKey);
   if (!bucket) {
-    bucket = { date: dateKey, tokens: createTokenTotals(), cost: 0, assistantMessages: 0, sessions: new Set() };
+    bucket = { date: dateKey, tokens: createTokenTotals(), cost: 0, assistantMessages: 0, toolCalls: 0, sessions: new Set(), models: new Map(), tools: new Map(), skills: new Map() };
     acc.days.set(dateKey, bucket);
-  }
-  return bucket;
-}
-
-function getModelBucket(acc: ReportAccumulator, provider: string, model: string): ModelBucket {
-  const key = `${provider}/${model}`;
-  let bucket = acc.models.get(key);
-  if (!bucket) {
-    bucket = {
-      provider,
-      model,
-      messages: 0,
-      tokens: createTokenTotals(),
-      recordedCost: 0,
-      repricedCost: 0,
-      unknownCostMessages: 0,
-      priceSources: new Map(),
-    };
-    acc.models.set(key, bucket);
   }
   return bucket;
 }
@@ -375,13 +350,17 @@ function addAssistantUsage(
   day.assistantMessages += 1;
   day.sessions.add(sessionId);
 
-  const model = getModelBucket(acc, message.provider, message.model);
-  model.messages += 1;
-  addUsageTokens(model.tokens, message.usage);
-  model.recordedCost += message.usage.cost.total;
-  model.repricedCost += cost.knownCost;
-  if (hasUnknownCost) model.unknownCostMessages += 1;
-  incrementCounter(model.priceSources, price ? `${price.source}:${price.key}` : 'unknown');
+  const dayModelKey = `${message.provider}/${message.model}`;
+  let dayModel = day.models.get(dayModelKey);
+  if (!dayModel) {
+    dayModel = { provider: message.provider, model: message.model, messages: 0, tokens: createTokenTotals(), repricedCost: 0, unknownCostMessages: 0, hasPrice: false };
+    day.models.set(dayModelKey, dayModel);
+  }
+  dayModel.messages += 1;
+  addUsageTokens(dayModel.tokens, message.usage);
+  dayModel.repricedCost += cost.knownCost;
+  if (hasUnknownCost) dayModel.unknownCostMessages += 1;
+  if (price) dayModel.hasPrice = true;
 }
 
 function updateLongestTask(
@@ -431,8 +410,10 @@ function scanSession(
       currentTaskStart = timestampMs;
       currentTaskEnd = timestampMs;
       acc.userMessages += 1;
-      for (const skill of extractSkillReferences(extractMessageText(message.content))) {
-        incrementCounter(acc.skills, skill);
+      const skillBlock = parseSkillBlock(extractMessageText(message.content));
+      if (skillBlock) {
+        incrementCounter(acc.skills, skillBlock.name);
+        incrementCounter(getDayBucket(acc, localDateKey(timestampMs)).skills, skillBlock.name);
       }
       continue;
     }
@@ -441,7 +422,7 @@ function scanSession(
       currentTaskEnd = timestampMs;
       acc.assistantMessages += 1;
       incrementCounter(acc.thinkingLevels, thinkingLevel);
-      collectAssistantToolCalls(message.content, seenToolCallIds, acc);
+      collectAssistantToolCalls(message.content, seenToolCallIds, timestampMs, acc);
       addAssistantUsage(ctx, liteLlmPrices, message as AssistantMessage, session.id, timestampMs, acc);
       continue;
     }
@@ -449,7 +430,7 @@ function scanSession(
     if (message.role === 'toolResult') {
       currentTaskEnd = timestampMs;
       const toolCallId = typeof message.toolCallId === 'string' ? message.toolCallId : undefined;
-      if (typeof message.toolName === 'string') addToolCall(message.toolName, toolCallId, seenToolCallIds, acc);
+      if (typeof message.toolName === 'string') addToolCall(message.toolName, toolCallId, seenToolCallIds, timestampMs, acc);
     }
   }
 
@@ -470,8 +451,6 @@ function createAccumulator(listedSessions: number): ReportAccumulator {
     tokens: createTokenTotals(),
     activeDays: new Set(),
     days: new Map(),
-    models: new Map(),
-    tools: new Map(),
     skills: new Map(),
     thinkingLevels: new Map(),
     longestTask: undefined,
@@ -510,23 +489,19 @@ function createDailyReport(days: Map<string, DayBucket>): UsageReport['daily'] {
       tokens: day.tokens.total,
       cost: day.cost,
       assistantMessages: day.assistantMessages,
+      toolCalls: day.toolCalls,
       sessions: day.sessions.size,
-    }));
-}
-
-function createModelReport(models: Map<string, ModelBucket>): UsageReport['topModels'] {
-  return [...models.values()]
-    .sort((left, right) => right.tokens.total - left.tokens.total || `${left.provider}/${left.model}`.localeCompare(`${right.provider}/${right.model}`))
-    .slice(0, 12)
-    .map((model) => ({
-      provider: model.provider,
-      model: model.model,
-      messages: model.messages,
-      tokens: model.tokens.total,
-      recordedCost: model.recordedCost,
-      repricedCost: model.repricedCost,
-      unknownCostMessages: model.unknownCostMessages,
-      priceSources: Object.fromEntries(model.priceSources.entries()),
+      models: [...day.models.values()].map((model) => ({
+        provider: model.provider,
+        model: model.model,
+        messages: model.messages,
+        tokens: model.tokens.total,
+        repricedCost: model.repricedCost,
+        unknownCostMessages: model.unknownCostMessages,
+        hasPrice: model.hasPrice,
+      })),
+      tools: [...day.tools.entries()].map(([name, count]) => ({ name, count })),
+      skills: [...day.skills.entries()].map(([name, count]) => ({ name, count })),
     }));
 }
 
@@ -569,9 +544,6 @@ function buildUsageReport(acc: ReportAccumulator, pricing: LiteLlmPriceLoad): Us
     },
     insights: createInsights(acc),
     daily,
-    topModels: createModelReport(acc.models),
-    topTools: sortedCounters(acc.tools, 12),
-    topSkills: sortedCounters(acc.skills, 12),
     scanErrors: acc.scanErrors,
   };
 }
@@ -1226,8 +1198,37 @@ function duration(seconds) {
   return secs + 's';
 }
 
-function priceSourceCount(model) {
-  return Object.keys(model.priceSources || {}).length;
+function aggregateLeaders(daily, field) {
+  const counts = new Map();
+  for (const day of daily) {
+    for (const entry of day[field]) counts.set(entry.name, (counts.get(entry.name) || 0) + finiteNumber(entry.count, field + ' count'));
+  }
+  return [...counts.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, 12)
+    .map(([name, count]) => ({ name, count }));
+}
+
+function aggregateModels(daily) {
+  const models = new Map();
+  for (const day of daily) {
+    for (const model of day.models) {
+      const key = model.provider + '/' + model.model;
+      let agg = models.get(key);
+      if (!agg) {
+        agg = { provider: model.provider, model: model.model, messages: 0, tokens: 0, repricedCost: 0, unknownCostMessages: 0, hasPrice: false };
+        models.set(key, agg);
+      }
+      agg.messages += finiteNumber(model.messages, 'model messages');
+      agg.tokens += finiteNumber(model.tokens, 'model tokens');
+      agg.repricedCost += finiteNumber(model.repricedCost, 'model cost');
+      agg.unknownCostMessages += finiteNumber(model.unknownCostMessages, 'model unknown');
+      if (model.hasPrice) agg.hasPrice = true;
+    }
+  }
+  return [...models.values()]
+    .sort((left, right) => right.tokens - left.tokens || (left.provider + '/' + left.model).localeCompare(right.provider + '/' + right.model))
+    .slice(0, 12);
 }
 
 function currentView(report) {
@@ -1239,6 +1240,10 @@ function currentView(report) {
     tokens: sum(daily, (day) => finiteNumber(day.tokens, 'daily tokens')),
     cost: sum(daily, (day) => finiteNumber(day.cost, 'daily cost')),
     messages: sum(daily, (day) => finiteNumber(day.assistantMessages, 'daily assistant messages')),
+    toolCalls: sum(daily, (day) => finiteNumber(day.toolCalls, 'daily tool calls')),
+    topModels: aggregateModels(daily),
+    topTools: aggregateLeaders(daily, 'tools'),
+    topSkills: aggregateLeaders(daily, 'skills'),
   };
 }
 
@@ -1256,7 +1261,7 @@ function renderKpis(report, view) {
     ['Total Tokens', fmtTokens(view.tokens), fmtTokens(t.tokens.total) + ' all-time', 'blue', 'ϟ'],
     ['Est. Cost', fmtCost(view.cost), fmtCost(t.repricedCost) + ' all-time', 'green', '$'],
     ['Asst. Messages', nf.format(view.messages), nf.format(t.userMessages) + ' user', 'indigo', '✉'],
-    ['Tool Calls', nf.format(t.toolCalls), nf.format(t.scannedSessions) + ' sessions', 'violet', '⌁'],
+    ['Tool Calls', nf.format(view.toolCalls), nf.format(t.toolCalls) + ' all-time', 'violet', '⌁'],
     ['Streak', t.currentStreakDays + 'd', 'Best: ' + t.longestStreakDays + 'd', 'amber', '●'],
     ['Longest Task', duration(longestTask && longestTask.seconds), taskSub, 'rose', '◷'],
   ];
@@ -1350,8 +1355,8 @@ function weeklySeries(daily) {
   return weeks;
 }
 
-function renderModels(report) {
-  const models = [...report.topModels].sort((left, right) => {
+function renderModels(view) {
+  const models = [...view.topModels].sort((left, right) => {
     const leftValue = finiteNumber(left[state.sortField], 'model ' + state.sortField);
     const rightValue = finiteNumber(right[state.sortField], 'model ' + state.sortField);
     return state.sortDir === 'desc' ? rightValue - leftValue : leftValue - rightValue;
@@ -1373,7 +1378,7 @@ function renderModels(report) {
   const rows = models.map((model) => {
     const provider = escapeHtml(model.provider);
     const name = escapeHtml(model.model);
-    const hasPrice = priceSourceCount(model) > 0;
+    const hasPrice = model.hasPrice;
     const unknown = model.unknownCostMessages > 0;
     return '<tr><td><div class="model-provider ' + providerColor(model.provider) + '">' + provider + '</div><div class="model-name">' + name + '</div></td><td>' + nf.format(model.messages) + '</td><td>' + fmtTokens(model.tokens) + '</td><td class="hide-sm ' + (unknown ? 'price-unknown' : 'price-ok') + '">' + fmtCost(model.repricedCost, unknown) + '</td><td class="hide-sm ' + (hasPrice ? 'check' : 'no-check') + '">' + (hasPrice ? '✓' : '—') + '</td></tr>';
   }).join('');
@@ -1398,7 +1403,7 @@ function toggleSort(field) {
     state.sortField = field;
     state.sortDir = 'desc';
   }
-  renderModels(state.report);
+  renderModels(currentView(state.report));
 }
 
 function renderBreakdown(report) {
@@ -1422,9 +1427,9 @@ function barRows(items, colorClass) {
   }).join('');
 }
 
-function renderLists(report) {
-  $('topTools').innerHTML = barRows(report.topTools, 'blue-bg');
-  $('topSkills').innerHTML = barRows(report.topSkills, 'violet-bg');
+function renderLists(view) {
+  $('topTools').innerHTML = barRows(view.topTools, 'blue-bg');
+  $('topSkills').innerHTML = barRows(view.topSkills, 'violet-bg');
 }
 
 function renderInsights(report) {
@@ -1482,14 +1487,15 @@ function render() {
   for (const button of document.querySelectorAll('.range-button')) button.classList.toggle('active', button.dataset.range === state.range);
   $('activitySummary').textContent = fmtTokens(view.tokens) + ' · ' + fmtCost(view.cost);
   $('trendRange').textContent = view.days + 'd trend';
-  $('unknownModels').textContent = report.totals.unknownCostMessages ? '⚠ ' + report.totals.unknownCostMessages + ' unknown' : '';
+  const viewUnknown = view.topModels.reduce((sum, model) => sum + model.unknownCostMessages, 0);
+  $('unknownModels').textContent = viewUnknown ? '⚠ ' + viewUnknown + ' unknown' : '';
   renderPricing(report);
   renderKpis(report, view);
   renderHeatmap(view);
   renderSparkline(view);
-  renderModels(report);
+  renderModels(view);
   renderBreakdown(report);
-  renderLists(report);
+  renderLists(view);
   renderInsights(report);
   renderMicroStats(report);
   renderErrors(report);
