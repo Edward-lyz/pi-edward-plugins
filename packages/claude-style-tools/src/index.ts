@@ -43,6 +43,7 @@ import {
 
 import * as Diff from "diff";
 import type { BundledLanguage, BundledTheme } from "shiki";
+import { Type } from "typebox";
 
 const RESET = "\x1b[0m";
 const TRANSPARENT_BG = "\x1b[49m";
@@ -649,7 +650,7 @@ function formatBranchedToolLines(lines: string[], index: number, total: number, 
 	return output;
 }
 
-const NON_GROUPABLE_TOOL_NAMES = new Set(["edit", "write", "apply_patch"]);
+const NON_GROUPABLE_TOOL_NAMES = new Set(["edit", "flat_edit", "write", "apply_patch"]);
 const ACTIVE_TOOL_GROUPS = new Set<any>();
 
 function isGroupableTool(value: unknown): value is InstanceType<typeof ToolExecutionComponent> {
@@ -6118,10 +6119,40 @@ export default function (pi: ExtensionAPI) {
 
 	const editTool = createEditTool(cwd);
 	pi.registerTool({
+		name: "flat_edit",
+		label: "flat_edit",
+		description: "Edit one file with one flat exact replacement. Use this instead of edit when making a single replacement. Arguments are path, oldText, and newText; do not pass an edits array.",
+		promptSnippet: "Make one precise file edit with flat exact text replacement arguments",
+		promptGuidelines: [
+			"Use flat_edit for a single exact replacement in one file.",
+			"Use edit instead of flat_edit when one file needs multiple disjoint replacements in one atomic call.",
+			"flat_edit oldText must match exactly and must be unique in the target file.",
+		],
+		parameters: Type.Object({
+			path: Type.String({ description: "Path to the file to edit (relative or absolute)." }),
+			oldText: Type.String({ description: "Exact text to replace. It must match exactly and be unique in the file." }),
+			newText: Type.String({ description: "Replacement text." }),
+		}, { additionalProperties: false }),
+		async execute(toolCallId, params, signal, onUpdate) {
+			if (params.oldText.length === 0) {
+				throw new Error("flat_edit oldText must not be empty.");
+			}
+			if (params.oldText === params.newText) {
+				throw new Error("flat_edit oldText and newText must differ.");
+			}
+			return editTool.execute(toolCallId, {
+				path: params.path,
+				edits: [{ oldText: params.oldText, newText: params.newText }],
+			}, signal, onUpdate);
+		},
+	});
+
+	pi.registerTool({
 		name: "edit",
 		label: "edit",
-		description: editTool.description,
+		description: `${editTool.description} For one replacement, prefer flat_edit to avoid nested edit arrays.`,
 		parameters: editTool.parameters,
+		prepareArguments: editTool.prepareArguments,
 		async execute(toolCallId, params, signal, onUpdate, _ctx) {
 			const fp = params.path ?? (params as any).file_path ?? "";
 			const operations = getEditOperations(params);
