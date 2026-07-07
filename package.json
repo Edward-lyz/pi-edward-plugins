@@ -58,7 +58,8 @@
       "packages/system-context/src/system-context.ts",
       "packages/subagent/src/index.ts",
       "packages/usage-report/src/usage-report.ts",
-      "packages/fff/src/index.ts"
+      "packages/fff/src/index.ts",
+      "packages/agent-loop/src/index.ts"
     ]
   }
 }

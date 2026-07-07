@@ -24,6 +24,7 @@ handles both automatically.
 
 | Extension | Path | What it does | Notes |
 |---|---|---|---|
+| `agent-loop` | `packages/agent-loop/src/index.ts` | General-purpose agent loop: `/loop goal <desc>` (repeat until the LLM declares done), `/loop passes <N> <task>` (fixed N passes), `/loop pipeline <s1\|s2\|s3> <goal>` (named stages). Provides a `loop_control` tool, a status widget, `/loop-stop`, and Ctrl+Shift+X emergency abort. | Ported from npm `pi-agent-loop`; goal mode has a 100-iteration safety cap. |
 | `claude-style-tools` | `packages/claude-style-tools/src/index.ts`, `packages/claude-style-tools/src/spinner.ts` | Vendors Claude Code-style tool rows, spinner, grouped tool calls, Shiki diffs, and Codex `exec_command` / `write_stdin` / `apply_patch` rendering. | Forked from `pi-claude-style-tools`; load both files together. |
 | `code-block-fix` | `packages/code-block-fix/src/code-block-fix.ts` | Renders markdown code blocks with Unicode box borders. | Monkey-patches Pi markdown rendering. |
 | `fff` | `packages/fff/src/index.ts` (+ other files in `packages/fff/src/`) | FFF-powered fuzzy path resolution for `read` / `grep`, plus `find_files` and `fff_multi_grep` agent tools and `@` editor autocomplete. Commands: `/fff-features`, `/fff-status`, `/reindex-fff`. | Forked from `ShpetimA/pi-fff`; needs the `@ff-labs/fff-node` native module, installed by `npm install` (or `./install.sh`). |
