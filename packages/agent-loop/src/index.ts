@@ -79,23 +79,33 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("loop", {
 		description:
 			"Start a loop. Usage: /loop goal <desc> | /loop passes <N> <task> | /loop pipeline <s1|s2|s3> <goal>",
-		getArgumentCompletions: () => [
-			{
-				value: "goal ",
-				label: "goal <description>",
-				description: "Loop until goal is met",
-			},
-			{
-				value: "passes ",
-				label: "passes <N> <task>",
-				description: "Run exactly N passes",
-			},
-			{
-				value: "pipeline ",
-				label: "pipeline <s1|s2|s3> <goal>",
-				description: "Run stages in order",
-			},
-		],
+		getArgumentCompletions: (prefix) => {
+			const parts = prefix.trimStart().split(/\s+/);
+			// Only complete the mode keyword (first arg). Once a mode is chosen
+			// and the user is typing free-form args, return null so the popup
+			// closes and Enter submits the message instead of selecting a item.
+			if (parts.length > 1) return null;
+			const first = parts[0] ?? "";
+			const modes = [
+				{
+					value: "goal ",
+					label: "goal <description>",
+					description: "Loop until goal is met",
+				},
+				{
+					value: "passes ",
+					label: "passes <N> <task>",
+					description: "Run exactly N passes",
+				},
+				{
+					value: "pipeline ",
+					label: "pipeline <s1|s2|s3> <goal>",
+					description: "Run stages in order",
+				},
+			];
+			const matches = modes.filter((m) => m.value.startsWith(first));
+			return matches.length > 0 ? matches : null;
+		},
 		handler: async (args, ctx) => {
 			if (!args?.trim()) {
 				ctx.ui.notify(
